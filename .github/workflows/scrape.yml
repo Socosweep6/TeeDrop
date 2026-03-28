@@ -2,8 +2,7 @@ name: Scrape Tee Times
 
 on:
   schedule:
-    # Every 15 minutes, 24/7. GitHub Actions uses UTC.
-    # Seattle is UTC-7 (PDT) or UTC-8 (PST).
+    # Every 15 minutes, 24/7 (UTC)
     - cron: '*/15 * * * *'
   workflow_dispatch: # Allow manual trigger from GitHub Actions UI
 
@@ -11,7 +10,7 @@ jobs:
   scrape:
     name: Scrape & Ingest
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -21,6 +20,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          npm install playwright
+          npx playwright install chromium --with-deps
 
       - name: Run scraper
         env:
