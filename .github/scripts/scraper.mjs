@@ -103,32 +103,57 @@ async function scrapeCpsWithPlaywright(course, dates, browser) {
   });
   const page = await context.newPage();
 
-  // Intercept JSON API calls the page makes — captures tee time data
+  // Intercept ALL JSON API calls — log them so we can discover the CPS API format
+  const allApiCalls = []; // { url, date, times }
   const interceptedTeeTimes = new Map(); // date → tee times array
+  let firstCourse = true; // only dump diagnostics for first course
+
   page.on('response', async (response) => {
     const resUrl = response.url();
-    if (!resUrl.includes('cps.golf') && !resUrl.includes('premiergolf')) return;
-    if (!response.headers()['content-type']?.includes('json')) return;
+    const ct = response.headers()['content-type'] || '';
+    if (!ct.includes('json')) return;
     try {
       const json = await response.json();
-      // Look for tee time data in the response
+      const urlDate = extractDateFromUrl(resUrl);
+
+      // Log API calls for debugging (first course only)
+      if (firstCourse) {
+        const preview = JSON.stringify(json).slice(0, 300);
+        console.log(`  [API] ${resUrl.slice(0, 100)} → ${preview}`);
+      }
+
+      // Try all known response shapes
       const times = extractCpsTeeTimesFromJson(json);
       if (times.length > 0) {
-        // Try to determine the date from the URL or request params
-        const urlDate = extractDateFromUrl(resUrl);
-        if (urlDate) {
-          interceptedTeeTimes.set(urlDate, times);
-        }
+        allApiCalls.push({ url: resUrl, date: urlDate, times });
+        if (urlDate) interceptedTeeTimes.set(urlDate, times);
+        // Also store without date key — last one wins for current page
+        interceptedTeeTimes.set('__latest__', { date: urlDate, times });
       }
-    } catch { /* not JSON or parse error */ }
+    } catch { /* ignore */ }
   });
 
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(2000); // let initial React render complete
+    // Use networkidle to wait for React to fully render + fetch data
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+    await sleep(1000);
 
     const title = await page.title();
     console.log(`  Page title: "${title}"`);
+
+    // Dump rendered HTML structure for first course (debugging)
+    if (firstCourse) {
+      const structure = await page.evaluate(() => {
+        const elements = Array.from(document.querySelectorAll('*'))
+          .filter(el => el.className && typeof el.className === 'string' && el.className.trim())
+          .slice(0, 30);
+        return elements.map(el =>
+          `${el.tagName}.${el.className.trim().split(/\s+/).slice(0,3).join('.')}: "${el.textContent.trim().slice(0,60)}"`
+        ).join('\n');
+      });
+      console.log(`  DOM structure:\n${structure.split('\n').map(l => '    ' + l).join('\n')}`);
+      firstCourse = false;
+    }
 
     // Try to navigate to each date and collect tee times
     for (const date of dates) {
@@ -136,33 +161,40 @@ async function scrapeCpsWithPlaywright(course, dates, browser) {
         // Navigate to the date — CPS usually accepts date as URL param or query string
         const dateUrl = `${url}?date=${date}`;
         interceptedTeeTimes.delete(date);
+        interceptedTeeTimes.delete('__latest__');
 
-        await page.goto(dateUrl, { waitUntil: 'networkidle', timeout: 20000 });
-        await sleep(1500);
+        await page.goto(dateUrl, { waitUntil: 'networkidle', timeout: 25000 });
+        await sleep(1000);
 
-        // Try extracting from DOM if interception didn't work
-        const domTimes = await extractCpsTeeTimesFromDom(page, date, course);
-        if (domTimes.length > 0) {
-          results.push(...domTimes);
-          console.log(`  ${date}: ${domTimes.length} tee times (DOM)`);
-        } else if (interceptedTeeTimes.has(date)) {
+        // Priority: API intercept by date → API intercept latest → DOM
+        let found = false;
+
+        if (interceptedTeeTimes.has(date)) {
           const apiTimes = interceptedTeeTimes.get(date).map(t => ({
-            ...t,
-            course: course.name,
-            date,
-            source: 'cps',
+            ...t, course: course.name, date, source: 'cps',
           }));
           results.push(...apiTimes);
-          console.log(`  ${date}: ${apiTimes.length} tee times (API intercept)`);
-        } else {
-          // Log DOM snapshot for debugging
-          const bodyPreview = await page.evaluate(() =>
-            Array.from(document.querySelectorAll('h1,h2,h3,[class*="tee"],[class*="time"],[class*="slot"]'))
-              .slice(0, 5)
-              .map(el => `${el.tagName}.${el.className}: ${el.textContent.trim().slice(0, 50)}`)
-              .join('\n')
-          ).catch(() => 'could not read DOM');
-          console.log(`  ${date}: 0 tee times. DOM sample:\n    ${bodyPreview.replace(/\n/g, '\n    ')}`);
+          console.log(`  ${date}: ${apiTimes.length} tee times (API)`);
+          found = true;
+        } else if (interceptedTeeTimes.has('__latest__')) {
+          // API fired but without date in URL — use latest captured
+          const latest = interceptedTeeTimes.get('__latest__');
+          const apiTimes = latest.times.map(t => ({
+            ...t, course: course.name, date, source: 'cps',
+          }));
+          results.push(...apiTimes);
+          console.log(`  ${date}: ${apiTimes.length} tee times (API latest)`);
+          found = true;
+        }
+
+        if (!found) {
+          const domTimes = await extractCpsTeeTimesFromDom(page, date, course);
+          if (domTimes.length > 0) {
+            results.push(...domTimes);
+            console.log(`  ${date}: ${domTimes.length} tee times (DOM)`);
+          } else {
+            console.log(`  ${date}: 0 tee times`);
+          }
         }
       } catch (err) {
         console.warn(`  ${date} error: ${err.message}`);
