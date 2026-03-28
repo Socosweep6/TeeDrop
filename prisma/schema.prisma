@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                String   @id @default(cuid())
+  name              String
+  email             String   @unique
+  password          String
+  phone             String?
+  tier              String   @default("free")
+  onboardingDone    Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  settings          UserSettings?
+  alerts            Alert[]
+}
+
+model UserSettings {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  user              User     @relation(fields: [userId], references: [id])
+  courses           String[] @default([])
+  selectedDates     String[] @default([])
+  startTime         String   @default("07:00")
+  endTime           String   @default("09:00")
+  players           Int      @default(4)
+  alertEmail        Boolean  @default(true)
+  alertSms          Boolean  @default(false)
+  alertEmailAddress String?
+  alertFrequency    String   @default("instant")
+  quietHoursStart   String?  @default("22:00")
+  quietHoursEnd     String?  @default("06:00")
+  dayOfWeek         String[] @default(["saturday"])
+  startDate         String?
+  endDate           String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model TeeTime {
+  id         String   @id @default(cuid())
+  course     String
+  date       String
+  time       String
+  players    Int      @default(4)
+  price      String?
+  holes      Int?     @default(18)
+  bookingUrl String?
+  source     String?  @default("golfnow")
+  scrapedAt  DateTime @default(now())
+  alerts     Alert[]
+
+  @@index([course, date])
+}
+
+model Alert {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  teeTimeId String
+  teeTime   TeeTime  @relation(fields: [teeTimeId], references: [id])
+  sentAt    DateTime @default(now())
+  method    String   @default("sms")
+
+  @@index([userId])
+}
