@@ -1,0 +1,30 @@
+name: Scrape Tee Times
+
+on:
+  schedule:
+    # Every 15 minutes, 24/7. GitHub Actions uses UTC.
+    # Seattle is UTC-7 (PDT) or UTC-8 (PST).
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Allow manual trigger from GitHub Actions UI
+
+jobs:
+  scrape:
+    name: Scrape & Ingest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run scraper
+        env:
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          GOLFNOW_API_KEY: ${{ secrets.GOLFNOW_API_KEY }}
+        run: node .github/scripts/scraper.mjs
