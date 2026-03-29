@@ -113,6 +113,9 @@ async function scrapeCpsWithPlaywright(course, dates, browser) {
   let capturedTeeTimeApiUrl = null; // Learn exact API endpoint from page
   const interceptedTeeTimes = new Map(); // date → tee times array
 
+  // Intercept ALL JSON API responses — broad search for tee time data
+  let lastApiCallUrl = null;
+
   page.on('response', async (response) => {
     const resUrl = response.url();
     const ct = response.headers()['content-type'] || '';
@@ -120,92 +123,104 @@ async function scrapeCpsWithPlaywright(course, dates, browser) {
     try {
       const json = await response.json();
 
-      // Capture the anonymous access token for direct API calls
+      // Capture the anonymous OAuth token for direct API calls later
       if (resUrl.includes('token/short') && json.access_token) {
         cpsAccessToken = json.access_token;
-        console.log(`  Got CPS access token`);
       }
 
-      // Capture facility info from GetAllOptions
-      if (resUrl.includes('GetAllOptions')) {
-        const facilities = json.shCourses || json.facilities || json.courses || [];
-        if (Array.isArray(facilities) && facilities.length > 0) {
-          console.log(`  Facilities: ${JSON.stringify(facilities.slice(0,3))}`);
-        }
-        // Log full response for debugging
-        console.log(`  GetAllOptions: ${JSON.stringify(json).slice(0, 500)}`);
+      // Skip well-known non-tee-time endpoints
+      if (resUrl.includes('GetAllOptions') || resUrl.includes('version.json') ||
+          resUrl.includes('i18n') || resUrl.includes('openid') || resUrl.includes('jwks') ||
+          resUrl.includes('FavIcon') || resUrl.includes('SiteLanguages')) {
+        return;
       }
 
-      // Capture the tee time API call URL and response
-      if (resUrl.includes('GetAvailableTimeSheet') || resUrl.includes('tee-time') || resUrl.includes('TeeTime') || resUrl.includes('teetime')) {
+      // Log ALL other API calls — find the tee time endpoint
+      const preview = JSON.stringify(json).slice(0, 200);
+      console.log(`  [API] ${resUrl.replace('https://premiergolf.cps.golf', '').slice(0, 100)} → ${preview}`);
+      lastApiCallUrl = resUrl;
+
+      // Try to extract tee times from any API response
+      const times = extractCpsTeeTimesFromJson(json);
+      if (times.length > 0) {
         capturedTeeTimeApiUrl = resUrl;
-        console.log(`  [FOUND TEESHEET API] ${resUrl.slice(0, 120)}`);
-        const times = extractCpsTeeTimesFromJson(json);
-        if (times.length > 0) {
-          const urlDate = extractDateFromUrl(resUrl);
-          if (urlDate) interceptedTeeTimes.set(urlDate, times);
-          interceptedTeeTimes.set('__latest__', { date: urlDate, times });
-          console.log(`  [API] Found ${times.length} tee times`);
-        } else {
-          console.log(`  [API] Response: ${JSON.stringify(json).slice(0, 300)}`);
-        }
+        const urlDate = extractDateFromUrl(resUrl);
+        if (urlDate) interceptedTeeTimes.set(urlDate, times);
+        interceptedTeeTimes.set('__latest__', { date: urlDate, times });
+        console.log(`  [TEESHEET] ${times.length} times found!`);
       }
     } catch { /* ignore */ }
   });
 
   try {
+    // Inject email into localStorage to bypass the gate (may or may not work)
+    await context.addInitScript((email) => {
+      try {
+        localStorage.setItem('userEmail', email);
+        localStorage.setItem('user_email', email);
+        localStorage.setItem('email', email);
+        localStorage.setItem('guestEmail', email);
+        localStorage.setItem('cpsGuestEmail', email);
+      } catch {}
+    }, CPS_SCRAPER_EMAIL);
+
+    // Load the booking page
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
     await sleep(1000);
 
-    // Handle the CPS email gate — enter dummy email and click NEXT
-    const emailInput = await page.$('input[type="email"], input[formcontrolname="email"], input[placeholder*="email" i]');
+    // Handle email gate if it's still showing
+    const emailInput = await page.$('input[type="email"], input[formcontrolname="email"]');
     if (emailInput) {
-      console.log(`  Email gate detected — submitting ${CPS_SCRAPER_EMAIL}`);
+      console.log(`  Email gate detected — submitting`);
       await emailInput.fill(CPS_SCRAPER_EMAIL);
-      const nextBtn = await page.$('button[type="submit"], button:has-text("NEXT"), button:has-text("Next")');
+      await page.keyboard.press('Tab'); // sometimes triggers validation
+      await sleep(500);
+      const nextBtn = await page.$('button[type="submit"], button:has-text("NEXT"), button:has-text("Next"), button:has-text("Continue")');
       if (nextBtn) {
         await nextBtn.click();
-        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+        // Wait for the booking page to appear (not the email gate)
+        await page.waitForFunction(
+          () => !document.querySelector('input[type="email"]') || document.querySelector('input[type="email"]')?.offsetParent === null,
+          { timeout: 10000 }
+        ).catch(() => {});
         await sleep(2000);
-        console.log(`  Submitted email — waiting for tee times...`);
       }
     }
 
-    // Collect tee times for each date
+    // Log current DOM to understand what's showing
+    const currentState = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll('h1,h2,h3,h4,[class*="booking"],[class*="tee"],[class*="date"],[class*="time"]'))
+        .slice(0, 8).map(e => `${e.tagName}: ${e.textContent.trim().slice(0,40)}`);
+      return els.join(' | ');
+    });
+    console.log(`  Page state: ${currentState}`);
+
+    // Try to use the date picker to navigate to each date (stay on same page)
     for (const date of dates) {
       try {
         interceptedTeeTimes.delete('__latest__');
 
-        if (capturedTeeTimeApiUrl && cpsAccessToken) {
-          // Direct API call — faster than navigating pages
-          const apiTimes = await callCpsTeeTimeApiDirectly(capturedTeeTimeApiUrl, date, cpsAccessToken);
-          if (apiTimes.length > 0) {
-            results.push(...apiTimes.map(t => ({ ...t, course: course.name, date, source: 'cps' })));
-            console.log(`  ${date}: ${apiTimes.length} tee times (direct API)`);
-            continue;
-          }
+        // Try Angular Material date picker
+        const [year, month, day] = date.split('-');
+        const mmddyyyy = `${month}/${day}/${year}`;
+
+        const dateInput = await page.$('input.mat-datepicker-input, input[matdatepickerinput], input[type="date"], input[placeholder*="date" i], mat-datepicker-input input');
+        if (dateInput) {
+          await dateInput.click({ clickCount: 3 });
+          await dateInput.fill(mmddyyyy);
+          await dateInput.press('Enter');
+          await sleep(2000); // wait for API call
+        } else {
+          // Try clicking the "next" arrow to advance days
+          const nextArrow = await page.$('button:has-text("›"), button:has-text(">"), [aria-label*="next" i], [aria-label*="forward" i], .next-day, [class*="next"]');
+          if (nextArrow) await nextArrow.click();
+          await sleep(1500);
         }
 
-        // Navigate with date query param and wait for API intercept
-        await page.goto(`${url}?date=${date}`, { waitUntil: 'networkidle', timeout: 20000 });
-        await sleep(1500);
-
-        // Handle email gate again if it reappeared
-        const emailInput2 = await page.$('input[type="email"], input[formcontrolname="email"]');
-        if (emailInput2) {
-          await emailInput2.fill(CPS_SCRAPER_EMAIL);
-          const btn = await page.$('button[type="submit"], button:has-text("NEXT")');
-          if (btn) { await btn.click(); await sleep(2000); }
-        }
-
-        if (interceptedTeeTimes.has(date)) {
-          const t = interceptedTeeTimes.get(date);
-          results.push(...t.map(x => ({ ...x, course: course.name, date, source: 'cps' })));
-          console.log(`  ${date}: ${t.length} tee times (API intercept)`);
-        } else if (interceptedTeeTimes.has('__latest__')) {
+        if (interceptedTeeTimes.has('__latest__')) {
           const { times } = interceptedTeeTimes.get('__latest__');
-          results.push(...times.map(x => ({ ...x, course: course.name, date, source: 'cps' })));
-          console.log(`  ${date}: ${times.length} tee times (API latest)`);
+          results.push(...times.map(t => ({ ...t, course: course.name, date, source: 'cps' })));
+          console.log(`  ${date}: ${times.length} tee times`);
         } else {
           const domTimes = await extractCpsTeeTimesFromDom(page, date, course);
           if (domTimes.length > 0) {
@@ -226,42 +241,6 @@ async function scrapeCpsWithPlaywright(course, dates, browser) {
   }
 
   return results;
-}
-
-// Call the CPS tee time API directly using a captured URL as a template
-async function callCpsTeeTimeApiDirectly(templateUrl, date, token) {
-  // Replace the date in the captured URL
-  // CPS dates in URL are typically like bookingDate=03/28/2026 (MM/DD/YYYY)
-  const [year, month, day] = date.split('-');
-  const mmddyyyy = `${month}/${day}/${year}`;
-  const mmddyyyyEncoded = encodeURIComponent(mmddyyyy);
-
-  // Replace date in URL
-  let newUrl = templateUrl
-    .replace(/bookingDate=[^&]+/i, `bookingDate=${mmddyyyyEncoded}`)
-    .replace(/BookingDate=[^&]+/i, `BookingDate=${mmddyyyyEncoded}`)
-    .replace(/date=[^&]+/i, `date=${mmddyyyyEncoded}`);
-
-  if (newUrl === templateUrl) {
-    // URL didn't have a date param we could replace — skip direct API
-    return [];
-  }
-
-  try {
-    const res = await fetch(newUrl, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-      },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) return [];
-    const json = await res.json();
-    return extractCpsTeeTimesFromJson(json);
-  } catch {
-    return [];
-  }
 }
 
 function extractCpsTeeTimesFromJson(json) {
