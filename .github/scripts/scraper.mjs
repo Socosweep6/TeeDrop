@@ -83,159 +83,380 @@ function to12Hour(raw) {
   return raw;
 }
 
-// ── CPS Scraper (Playwright) ──────────────────────────────────────────────────
+// ── CPS Scraper ───────────────────────────────────────────────────────────────
 //
-// CPS (Club Prophet Systems) booking pages are React SPAs at:
-//   https://premiergolf.cps.golf/reserve/{slug}
-//
-// The page shows an email gate before tee times. We:
-// 1. Load the page, capturing the anonymous OAuth token from identityapi
-// 2. Submit the email form with a dummy email to pass the gate
-// 3. Intercept the tee time API call to learn the exact endpoint + facility IDs
-// 4. For subsequent dates, call the API directly with the bearer token
+// Strategy: bypass email gate entirely.
+// 1. Load ONE CPS page (no email submission) to capture anonymous OAuth token
+//    and GetAllOptions response (contains all courseIds).
+// 2. Make direct HTTP calls to tee time API using the bearer token.
+//    The email gate is frontend-only — the API doesn't enforce it.
 
-const CPS_SCRAPER_EMAIL = 'scraper@teedrop.app';
-let cpsAccessToken = null;  // cached between courses (same session)
-let cpsFacilityMap = {};     // slug → { facilityId, courseId }
+let cpsAccessToken = null;    // anonymous bearer token
+let cpsAllOptions = null;     // raw GetAllOptions response
+let cpsCourseIdMap = {};      // cpsSlug → courseId (built from GetAllOptions)
+let cpsInitDone = false;
 
-async function scrapeCpsWithPlaywright(course, dates, browser) {
-  const results = [];
-  const url = `https://premiergolf.cps.golf/reserve/${course.cpsSlug}`;
-  console.log(`  Opening ${url}`);
+// Hardcoded courseId map as fallback (populated after first successful run)
+// Format: cpsSlug → courseId
+// These will be discovered via logging on first run
+const CPS_KNOWN_COURSE_IDS = {
+  // Will be populated once we see the GetAllOptions response in logs
+};
 
+async function initCpsSession(browser) {
+  if (cpsInitDone) return;
+
+  console.log('  [CPS] Initializing — loading page to capture token...');
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     viewport: { width: 1280, height: 900 },
-    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
   });
   const page = await context.newPage();
 
-  let capturedTeeTimeApiUrl = null; // Learn exact API endpoint from page
-  const interceptedTeeTimes = new Map(); // date → tee times array
-
-  // Intercept ALL JSON API responses — broad search for tee time data
-  let lastApiCallUrl = null;
-
   page.on('response', async (response) => {
-    const resUrl = response.url();
+    const url = response.url();
     const ct = response.headers()['content-type'] || '';
     if (!ct.includes('json')) return;
     try {
       const json = await response.json();
 
-      // Capture the anonymous OAuth token for direct API calls later
-      if (resUrl.includes('token/short') && json.access_token) {
+      // Capture anonymous OAuth token
+      if (url.includes('token/short') && json.access_token) {
         cpsAccessToken = json.access_token;
+        console.log('  [CPS] Anonymous token captured');
       }
 
-      // Skip well-known non-tee-time endpoints
-      if (resUrl.includes('GetAllOptions') || resUrl.includes('version.json') ||
-          resUrl.includes('i18n') || resUrl.includes('openid') || resUrl.includes('jwks') ||
-          resUrl.includes('FavIcon') || resUrl.includes('SiteLanguages')) {
-        return;
+      // Capture GetAllOptions — contains courseId list for this tenant
+      if (url.includes('GetAllOptions')) {
+        cpsAllOptions = json;
+        buildCpsCourseIdMap(json);
+        // Log full structure to understand courseId mapping
+        console.log(`  [CPS] GetAllOptions (${url.split('/').pop()}):`, JSON.stringify(json).slice(0, 1000));
       }
 
-      // Log ALL other API calls — find the tee time endpoint
-      const preview = JSON.stringify(json).slice(0, 200);
-      console.log(`  [API] ${resUrl.replace('https://premiergolf.cps.golf', '').slice(0, 100)} → ${preview}`);
-      lastApiCallUrl = resUrl;
-
-      // Try to extract tee times from any API response
-      const times = extractCpsTeeTimesFromJson(json);
-      if (times.length > 0) {
-        capturedTeeTimeApiUrl = resUrl;
-        const urlDate = extractDateFromUrl(resUrl);
-        if (urlDate) interceptedTeeTimes.set(urlDate, times);
-        interceptedTeeTimes.set('__latest__', { date: urlDate, times });
-        console.log(`  [TEESHEET] ${times.length} times found!`);
+      // Log ALL other API calls to discover tee sheet endpoint
+      const skip = url.includes('version.json') || url.includes('i18n') ||
+                   url.includes('openid') || url.includes('jwks') ||
+                   url.includes('FavIcon') || url.includes('SiteLanguages') ||
+                   url.includes('token/short') || url.includes('GetAllOptions');
+      if (!skip) {
+        const path = url.replace('https://premiergolf.cps.golf', '').split('?')[0];
+        console.log(`  [CPS API] ${path} → ${JSON.stringify(json).slice(0, 150)}`);
       }
     } catch { /* ignore */ }
   });
 
   try {
-    // Inject email into localStorage to bypass the gate (may or may not work)
-    await context.addInitScript((email) => {
-      try {
-        localStorage.setItem('userEmail', email);
-        localStorage.setItem('user_email', email);
-        localStorage.setItem('email', email);
-        localStorage.setItem('guestEmail', email);
-        localStorage.setItem('cpsGuestEmail', email);
-      } catch {}
-    }, CPS_SCRAPER_EMAIL);
+    // Load first course page — just to trigger token/short and GetAllOptions
+    // Do NOT submit email gate — just let the page load naturally
+    await page.goto('https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
+      { waitUntil: 'networkidle', timeout: 30000 });
+    await sleep(3000); // extra wait to ensure all init API calls complete
+  } catch (err) {
+    console.warn(`  [CPS] Init page load error: ${err.message}`);
+  } finally {
+    await context.close();
+  }
 
-    // Load the booking page
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-    await sleep(1000);
+  cpsInitDone = true;
+  console.log(`  [CPS] Init done. Token: ${cpsAccessToken ? 'YES' : 'NO'} | CourseIds: ${Object.keys(cpsCourseIdMap).length}`);
+}
 
-    // Handle email gate if it's still showing
-    const emailInput = await page.$('input[type="email"], input[formcontrolname="email"]');
-    if (emailInput) {
-      console.log(`  Email gate detected — submitting`);
-      await emailInput.fill(CPS_SCRAPER_EMAIL);
-      await page.keyboard.press('Tab'); // sometimes triggers validation
-      await sleep(500);
-      const nextBtn = await page.$('button[type="submit"], button:has-text("NEXT"), button:has-text("Next"), button:has-text("Continue")');
-      if (nextBtn) {
-        await nextBtn.click();
-        // Wait for the booking page to appear (not the email gate)
-        await page.waitForFunction(
-          () => !document.querySelector('input[type="email"]') || document.querySelector('input[type="email"]')?.offsetParent === null,
-          { timeout: 10000 }
-        ).catch(() => {});
-        await sleep(2000);
+function buildCpsCourseIdMap(options) {
+  // GetAllOptions has various shapes — try to find courseId + name pairs
+  const tryExtract = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    if (Array.isArray(obj)) {
+      obj.forEach(tryExtract);
+      return;
+    }
+    // Look for objects with courseId and name/courseName
+    if (obj.courseId && (obj.name || obj.courseName || obj.description)) {
+      const name = (obj.name || obj.courseName || obj.description || '').toLowerCase();
+      const id = obj.courseId;
+      // Map name → id
+      cpsCourseIdMap[`__name:${name}`] = id;
+    }
+    // Also look for siteId as an alternative
+    if (obj.siteId && (obj.name || obj.siteName)) {
+      const name = (obj.name || obj.siteName || '').toLowerCase();
+      cpsCourseIdMap[`__site:${name}`] = obj.siteId;
+    }
+    Object.values(obj).forEach(v => {
+      if (v && typeof v === 'object') tryExtract(v);
+    });
+  };
+  tryExtract(options);
+}
+
+function getCpsCourseId(cpsSlug) {
+  // Try hardcoded map first
+  if (CPS_KNOWN_COURSE_IDS[cpsSlug]) return CPS_KNOWN_COURSE_IDS[cpsSlug];
+
+  // Try matching by slug-derived name fragments
+  const slugWords = cpsSlug.replace(/-golf-course$/, '').replace(/-golf-center$/, '').replace(/-/g, ' ');
+  for (const [key, id] of Object.entries(cpsCourseIdMap)) {
+    const name = key.replace('__name:', '').replace('__site:', '');
+    if (name.includes(slugWords) || slugWords.includes(name.split(' ')[0])) {
+      return id;
+    }
+  }
+  return null;
+}
+
+// CPS tee sheet API endpoints to try (in order)
+const CPS_TEESHEET_ENDPOINTS = [
+  'GetAvailableTimeSheet',
+  'GetAvailableTeeTimesByDate',
+  'GetAvailableTeeTimes',
+  'GetTeeSheet',
+  'AvailableTeeTimes',
+  'TeeSheet',
+];
+
+async function fetchCpsTeeTimesApi(courseId, date, holeCount = 18) {
+  if (!cpsAccessToken) return null; // no token, skip
+
+  const [y, m, d] = date.split('-');
+  const bookingDate = encodeURIComponent(`${m}/${d}/${y}`);
+
+  for (const endpoint of CPS_TEESHEET_ENDPOINTS) {
+    const url = `https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/${endpoint}?tenantAlias=premiergolf&courseId=${courseId}&bookingDate=${bookingDate}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${cpsAccessToken}`,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+      const text = await res.text();
+      if (res.status === 404) continue; // wrong endpoint name
+      console.log(`  [CPS] ${endpoint}(courseId=${courseId}, ${date}) → ${res.status}: ${text.slice(0, 200)}`);
+      if (res.ok) {
+        try {
+          const json = JSON.parse(text);
+          const times = extractCpsTeeTimesFromJson(json);
+          return times; // return even if empty — endpoint found
+        } catch {
+          return []; // valid endpoint, unparseable response
+        }
+      }
+      // Non-404, non-200: log and continue trying
+    } catch (err) {
+      console.warn(`  [CPS] ${endpoint} fetch error: ${err.message}`);
+    }
+  }
+
+  // All endpoints returned 404 — log for debugging
+  console.log(`  [CPS] All endpoints 404 for courseId=${courseId}. CourseIdMap keys: ${Object.keys(cpsCourseIdMap).slice(0,10).join(', ')}`);
+  return null;
+}
+
+async function scrapeCps(course, dates, browser) {
+  // Initialize session once (captures token + courseIds)
+  await initCpsSession(browser);
+
+  const courseId = getCpsCourseId(course.cpsSlug);
+  console.log(`  CourseId for ${course.cpsSlug}: ${courseId ?? 'UNKNOWN'}`);
+
+  if (!courseId) {
+    console.log(`  [CPS] Cannot scrape — no courseId. Check GetAllOptions log above.`);
+    // Log all known IDs to help debug
+    console.log(`  [CPS] Known IDs: ${JSON.stringify(cpsCourseIdMap).slice(0, 300)}`);
+    return [];
+  }
+
+  const results = [];
+  const holeCount = course.holes === 9 ? 9 : 18;
+
+  for (const date of dates) {
+    try {
+      const times = await fetchCpsTeeTimesApi(courseId, date, holeCount);
+      if (times === null) {
+        console.log(`  ${date}: API not reachable`);
+        break; // No point trying more dates if all endpoints fail
+      }
+      if (times.length > 0) {
+        results.push(...times.map(t => ({ ...t, course: course.name, date, source: 'cps' })));
+        console.log(`  ${date}: ${times.length} tee times`);
+      } else {
+        console.log(`  ${date}: 0 tee times`);
+      }
+    } catch (err) {
+      console.warn(`  ${date}: ${err.message}`);
+    }
+    await sleep(200); // be polite
+  }
+
+  return results;
+}
+
+function extractCpsTeeTimesFromJson(json) {
+  // Common CPS JSON shapes — check various field names
+  const candidates = [
+    json.tee_times, json.teeTimes, json.times, json.data,
+    json.availableTimes, json.available_times, json.slots,
+    json.timeSheet, json.TimeSheet, json.teeSheet,
+    Array.isArray(json) ? json : null,
+  ].filter(Boolean);
+
+  for (const arr of candidates) {
+    if (!Array.isArray(arr) || arr.length === 0) continue;
+    const first = arr[0];
+    // Check for common time field names
+    if (first.time || first.start_time || first.teeTime || first.TeeTime ||
+        first.startTime || first.StartTime || first.teeTimeFrom) {
+      return arr.map(slot => ({
+        time: to12Hour(
+          slot.time || slot.start_time || slot.teeTime || slot.TeeTime ||
+          slot.startTime || slot.StartTime || slot.teeTimeFrom
+        ),
+        players: slot.available_spots || slot.availableSpots || slot.players ||
+                 slot.maxPlayers || slot.MaxPlayers || 4,
+        price: slot.price != null
+          ? (typeof slot.price === 'string' ? slot.price : `$${(slot.price / 100).toFixed(2)}`)
+          : null,
+        holes: slot.holes || slot.nb_holes || slot.HoleCount || 18,
+        booking_url: slot.booking_url || slot.bookingUrl || null,
+      }));
+    }
+  }
+  return [];
+}
+
+// ── Chronogolf Scraper (Playwright) ──────────────────────────────────────────
+//
+// Chronogolf pages (https://www.chronogolf.com/club/{slug}) are React SPAs.
+// We intercept ALL JSON network responses to discover the internal tee sheet API.
+
+async function scrapeChronogolfWithPlaywright(course, dates, browser) {
+  const results = [];
+  const baseUrl = `https://www.chronogolf.com/club/${course.chronogolfSlug}`;
+  console.log(`  Opening ${baseUrl}`);
+
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 900 },
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  });
+  const page = await context.newPage();
+
+  // Intercept ALL JSON responses — log everything to discover tee sheet API
+  const interceptedByDate = new Map();
+  let foundApiPattern = null;
+
+  page.on('response', async (response) => {
+    const resUrl = response.url();
+    const ct = response.headers()['content-type'] || '';
+    if (!ct.includes('json')) return;
+
+    try {
+      const json = await response.json();
+
+      // Try to extract tee times from any response
+      const times = extractChronogolfTeeTimes(json);
+      if (times.length > 0) {
+        const date = extractDateFromUrl(resUrl) || extractDateFromJson(json);
+        console.log(`  [CHRONO] Tee times found! ${resUrl.slice(0, 100)} → ${times.length} times`);
+        if (date) interceptedByDate.set(date, times);
+        interceptedByDate.set('__latest__', { date, times });
+        foundApiPattern = resUrl;
+        return;
+      }
+
+      // Log all API calls to understand the API shape
+      const skip = resUrl.includes('google') || resUrl.includes('facebook') ||
+                   resUrl.includes('analytics') || resUrl.includes('hotjar') ||
+                   resUrl.includes('.css') || resUrl.includes('font') ||
+                   resUrl.includes('stripe') || resUrl.includes('intercom') ||
+                   resUrl.includes('segment.io') || resUrl.includes('sentry');
+      if (!skip) {
+        const shortUrl = resUrl.replace('https://', '').slice(0, 100);
+        const preview = JSON.stringify(json).slice(0, 150);
+        console.log(`  [CHRONO API] ${shortUrl} → ${preview}`);
+      }
+    } catch { /* ignore */ }
+  });
+
+  try {
+    const resp = await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const status = resp?.status();
+    console.log(`  HTTP ${status}`);
+
+    if (status === 403 || status === 404) {
+      console.log(`  Slug not found: ${course.chronogolfSlug}`);
+      await context.close();
+      return results;
+    }
+
+    // Wait for initial page load
+    await sleep(3000);
+
+    // First date — navigate using URL param
+    const firstDate = dates[0];
+    await page.goto(`${baseUrl}?date=${firstDate}`, { waitUntil: 'networkidle', timeout: 20000 });
+    await sleep(2000);
+
+    // Check if we found a tee time API pattern on first load
+    if (interceptedByDate.has('__latest__')) {
+      const { date, times } = interceptedByDate.get('__latest__');
+      if (times.length > 0 && date) {
+        results.push(...times.map(t => ({ ...t, course: course.name, date, source: 'chronogolf' })));
+        console.log(`  ${date}: ${times.length} tee times (API)`);
       }
     }
 
-    // Log current DOM to understand what's showing
-    const currentState = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll('h1,h2,h3,h4,[class*="booking"],[class*="tee"],[class*="date"],[class*="time"]'))
-        .slice(0, 8).map(e => `${e.tagName}: ${e.textContent.trim().slice(0,40)}`);
-      return els.join(' | ');
-    });
-    console.log(`  Page state: ${currentState}`);
-
-    // Try to use the date picker to navigate to each date (stay on same page)
-    for (const date of dates) {
+    // Navigate remaining dates using the date picker (avoid full page reloads)
+    for (const date of dates.slice(1)) {
       try {
-        interceptedTeeTimes.delete('__latest__');
+        interceptedByDate.delete('__latest__');
 
-        // Try Angular Material date picker
-        const [year, month, day] = date.split('-');
-        const mmddyyyy = `${month}/${day}/${year}`;
-
-        const dateInput = await page.$('input.mat-datepicker-input, input[matdatepickerinput], input[type="date"], input[placeholder*="date" i], mat-datepicker-input input');
+        // Try the date input/picker
+        const dateInput = await page.$('input[type="date"], input[placeholder*="date" i], [data-testid*="date"]');
         if (dateInput) {
           await dateInput.click({ clickCount: 3 });
-          await dateInput.fill(mmddyyyy);
+          await dateInput.fill(date);
           await dateInput.press('Enter');
-          await sleep(2000); // wait for API call
+          await sleep(2000);
         } else {
-          // Try clicking the "next" arrow to advance days
-          const nextArrow = await page.$('button:has-text("›"), button:has-text(">"), [aria-label*="next" i], [aria-label*="forward" i], .next-day, [class*="next"]');
-          if (nextArrow) await nextArrow.click();
-          await sleep(1500);
+          // Navigate by URL
+          await page.goto(`${baseUrl}?date=${date}`, { waitUntil: 'networkidle', timeout: 20000 });
+          await sleep(2000);
         }
 
-        if (interceptedTeeTimes.has('__latest__')) {
-          const { times } = interceptedTeeTimes.get('__latest__');
-          results.push(...times.map(t => ({ ...t, course: course.name, date, source: 'cps' })));
+        if (interceptedByDate.has('__latest__')) {
+          const { times } = interceptedByDate.get('__latest__');
+          results.push(...times.map(t => ({ ...t, course: course.name, date, source: 'chronogolf' })));
           console.log(`  ${date}: ${times.length} tee times`);
         } else {
-          const domTimes = await extractCpsTeeTimesFromDom(page, date, course);
-          if (domTimes.length > 0) {
-            results.push(...domTimes);
-            console.log(`  ${date}: ${domTimes.length} tee times (DOM)`);
-          } else {
-            console.log(`  ${date}: 0`);
-          }
+          console.log(`  ${date}: 0 tee times`);
         }
       } catch (err) {
-        console.warn(`  ${date}: ${err.message}`);
+        console.warn(`  ${date} error: ${err.message}`);
       }
     }
+
+    if (results.length === 0) {
+      // Log current page URL and title for debugging
+      const title = await page.title().catch(() => 'N/A');
+      const url = page.url();
+      console.log(`  [DEBUG] Final URL: ${url}`);
+      console.log(`  [DEBUG] Page title: ${title}`);
+
+      // Log visible text elements that might indicate error/auth state
+      const text = await page.evaluate(() => {
+        const els = Array.from(document.querySelectorAll('h1,h2,h3,p,[class*="error"],[class*="message"],[class*="sign"],[class*="login"]'));
+        return els.slice(0, 5).map(e => e.textContent?.trim().slice(0, 80)).filter(Boolean).join(' | ');
+      }).catch(() => '');
+      if (text) console.log(`  [DEBUG] Page content: ${text}`);
+    }
+
   } catch (err) {
-    console.error(`  Failed: ${err.message}`);
+    console.error(`  Failed to load ${baseUrl}: ${err.message}`);
   } finally {
     await context.close();
   }
@@ -243,81 +464,43 @@ async function scrapeCpsWithPlaywright(course, dates, browser) {
   return results;
 }
 
-function extractCpsTeeTimesFromJson(json) {
-  // Common CPS JSON shapes
+function extractChronogolfTeeTimes(json) {
+  // Chronogolf API shapes — check various structures
   const candidates = [
-    json.tee_times, json.teeTimes, json.times, json.data,
-    json.availableTimes, json.available_times,
+    json.tee_times, json.teeTimes, json.available_tee_times,
+    json.data?.tee_times, json.data?.teeTimes, json.data,
+    json.result?.tee_times, json.results,
     Array.isArray(json) ? json : null,
   ].filter(Boolean);
 
   for (const arr of candidates) {
-    if (Array.isArray(arr) && arr.length > 0) {
-      const first = arr[0];
-      if (first.time || first.start_time || first.teeTime || first.TeeTime) {
-        return arr.map(slot => ({
-          time: to12Hour(slot.time || slot.start_time || slot.teeTime || slot.TeeTime),
-          players: slot.available_spots || slot.availableSpots || slot.players || slot.maxPlayers || 4,
-          price: slot.price != null
-            ? (typeof slot.price === 'string' ? slot.price : `$${(slot.price / 100).toFixed(2)}`)
-            : null,
-          holes: slot.holes || slot.nb_holes || 18,
-          booking_url: slot.booking_url || slot.bookingUrl || null,
-        }));
-      }
+    if (!Array.isArray(arr) || arr.length === 0) continue;
+    const first = arr[0];
+    if (first.time || first.start_time || first.tee_time || first.startTime ||
+        first.teeTime || first.start || first.booking_time) {
+      return arr.map(slot => ({
+        time: to12Hour(
+          slot.time || slot.start_time || slot.tee_time ||
+          slot.startTime || slot.teeTime || slot.start || slot.booking_time
+        ),
+        players: slot.max_players || slot.nb_players || slot.players ||
+                 slot.maxPlayers || slot.available_spots || 4,
+        price: slot.price != null
+          ? (typeof slot.price === 'number' && slot.price > 100
+              ? `$${(slot.price / 100).toFixed(2)}` // price in cents
+              : `$${Number(slot.price).toFixed(2)}`)
+          : null,
+        holes: slot.nb_holes || slot.holes || slot.holeCount || 18,
+        booking_url: slot.booking_url || slot.url || slot.link || null,
+      }));
     }
   }
   return [];
 }
 
-async function extractCpsTeeTimesFromDom(page, date, course) {
-  return page.evaluate(({ date, courseName, defaultHoles }) => {
-    const results = [];
-
-    // Try common CSS patterns for tee time slots
-    const selectors = [
-      '[class*="tee-time"]',
-      '[class*="teeTime"]',
-      '[class*="time-slot"]',
-      '[class*="timeSlot"]',
-      '[data-time]',
-      '[class*="booking-item"]',
-      '[class*="available"]',
-      '[class*="reservation"]',
-    ];
-
-    let slots = [];
-    for (const sel of selectors) {
-      const found = document.querySelectorAll(sel);
-      if (found.length > 0) { slots = Array.from(found); break; }
-    }
-
-    for (const slot of slots) {
-      const text = slot.innerText || slot.textContent || '';
-      const timeMatch = text.match(/\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\b/);
-      if (!timeMatch) continue;
-
-      const priceMatch = text.match(/\$[\d.]+/);
-      const playerMatch = text.match(/(\d)\s*(?:player|spot|golfer)/i);
-
-      results.push({
-        course: courseName,
-        date,
-        time: timeMatch[1],
-        players: playerMatch ? parseInt(playerMatch[1]) : 4,
-        price: priceMatch ? priceMatch[0] : null,
-        holes: defaultHoles || 18,
-        booking_url: null,
-        source: 'cps',
-      });
-    }
-
-    return results;
-  }, { date, courseName: course.name, defaultHoles: course.holes || 18 });
-}
-
 function extractDateFromUrl(url) {
   const match = url.match(/[?&]date=(\d{4}-\d{2}-\d{2})/) ||
+                url.match(/[?&]booking_date=(\d{4}-\d{2}-\d{2})/) ||
                 url.match(/[?&]BookingDate=(\d{1,2}%2F\d{1,2}%2F\d{4})/) ||
                 url.match(/\/(\d{4}-\d{2}-\d{2})/);
   if (!match) return null;
@@ -329,163 +512,11 @@ function extractDateFromUrl(url) {
   return d;
 }
 
-// ── Chronogolf Scraper (Playwright) ──────────────────────────────────────────
-//
-// Chronogolf pages (https://www.chronogolf.com/club/{slug}) are React SPAs.
-// We intercept the internal tee sheet API responses.
-
-async function scrapeChronogolfWithPlaywright(course, dates, browser) {
-  const results = [];
-  const url = `https://www.chronogolf.com/club/${course.chronogolfSlug}`;
-  console.log(`  Opening ${url}`);
-
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 900 },
-    extraHTTPHeaders: {
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    },
-  });
-  const page = await context.newPage();
-
-  // Intercept Chronogolf tee sheet API
-  const interceptedByDate = new Map();
-  page.on('response', async (response) => {
-    const resUrl = response.url();
-    if (!resUrl.includes('chronogolf.com') && !resUrl.includes('teesheet')) return;
-    if (!response.headers()['content-type']?.includes('json')) return;
-    try {
-      const json = await response.json();
-      const times = extractChronogolfTeeTimes(json);
-      if (times.length > 0) {
-        const date = extractDateFromUrl(resUrl) || extractDateFromJson(json);
-        if (date) interceptedByDate.set(date, times);
-      }
-    } catch { /* ignore */ }
-  });
-
-  try {
-    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    const status = resp?.status();
-    console.log(`  HTTP ${status}`);
-
-    if (status === 403 || status === 404) {
-      console.log(`  Course not accessible at this URL — may need different slug or auth`);
-      return results;
-    }
-
-    await sleep(2000);
-
-    for (const date of dates) {
-      try {
-        // Navigate with date in query param
-        const dateUrl = `${url}?date=${date}`;
-        interceptedByDate.delete(date);
-
-        await page.goto(dateUrl, { waitUntil: 'networkidle', timeout: 20000 });
-        await sleep(2000);
-
-        if (interceptedByDate.has(date)) {
-          const times = interceptedByDate.get(date).map(t => ({
-            ...t,
-            course: course.name,
-            date,
-            source: 'chronogolf',
-          }));
-          results.push(...times);
-          console.log(`  ${date}: ${times.length} tee times (API intercept)`);
-        } else {
-          // DOM extraction fallback
-          const domTimes = await extractChronogolfTeeTimesFromDom(page, date, course);
-          if (domTimes.length > 0) {
-            results.push(...domTimes);
-            console.log(`  ${date}: ${domTimes.length} tee times (DOM)`);
-          } else {
-            console.log(`  ${date}: 0 tee times`);
-          }
-        }
-      } catch (err) {
-        console.warn(`  ${date} error: ${err.message}`);
-      }
-    }
-  } catch (err) {
-    console.error(`  Failed to load ${url}: ${err.message}`);
-  } finally {
-    await context.close();
-  }
-
-  return results;
-}
-
-function extractChronogolfTeeTimes(json) {
-  // Chronogolf API shapes
-  const candidates = [
-    json.tee_times, json.teeTimes, json.available_tee_times,
-    json.data?.tee_times, json.data,
-    Array.isArray(json) ? json : null,
-  ].filter(Boolean);
-
-  for (const arr of candidates) {
-    if (Array.isArray(arr) && arr.length > 0) {
-      const first = arr[0];
-      if (first.time || first.start_time || first.tee_time) {
-        return arr.map(slot => ({
-          time: to12Hour(slot.time || slot.start_time || slot.tee_time),
-          players: slot.max_players || slot.nb_players || slot.players || 4,
-          price: slot.price != null
-            ? (typeof slot.price === 'number' && slot.price > 100
-                ? `$${(slot.price / 100).toFixed(2)}` // cents
-                : `$${Number(slot.price).toFixed(2)}`)
-            : null,
-          holes: slot.nb_holes || slot.holes || 18,
-          booking_url: slot.booking_url || slot.url || null,
-        }));
-      }
-    }
-  }
-  return [];
-}
-
 function extractDateFromJson(json) {
-  // Look for date in JSON response
-  const d = json.date || json.booking_date || json.selected_date || json.data?.date;
-  if (d && /\d{4}-\d{2}-\d{2}/.test(d)) return d;
+  const d = json.date || json.booking_date || json.selected_date ||
+            json.data?.date || json.bookingDate;
+  if (d && /\d{4}-\d{2}-\d{2}/.test(String(d))) return String(d).match(/\d{4}-\d{2}-\d{2}/)[0];
   return null;
-}
-
-async function extractChronogolfTeeTimesFromDom(page, date, course) {
-  return page.evaluate(({ date, courseName }) => {
-    const results = [];
-    const selectors = [
-      '[class*="tee-time"]', '[class*="teeTime"]',
-      '[class*="slot"]', '[class*="booking"]',
-      '[class*="available"]', '[class*="time-block"]',
-    ];
-    let slots = [];
-    for (const sel of selectors) {
-      const found = document.querySelectorAll(sel);
-      if (found.length > 0) { slots = Array.from(found); break; }
-    }
-    for (const slot of slots) {
-      const text = slot.innerText || '';
-      const timeMatch = text.match(/\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\b/);
-      if (!timeMatch) continue;
-      const priceMatch = text.match(/\$[\d.]+/);
-      const playerMatch = text.match(/(\d)\s*(?:player|golfer|people)/i);
-      results.push({
-        course: courseName,
-        date,
-        time: timeMatch[1],
-        players: playerMatch ? parseInt(playerMatch[1]) : 4,
-        price: priceMatch ? priceMatch[0] : null,
-        holes: 18,
-        booking_url: null,
-        source: 'chronogolf',
-      });
-    }
-    return results;
-  }, { date, courseName: course.name });
 }
 
 // ── GolfNow Scraper (HTTP — no Playwright needed) ─────────────────────────────
@@ -563,7 +594,7 @@ async function main() {
 
       try {
         if (course.bookingSystem === 'cps') {
-          times = await scrapeCpsWithPlaywright(course, dates, browser);
+          times = await scrapeCps(course, dates, browser);
           stats.cps += times.length;
         } else if (course.bookingSystem === 'chronogolf') {
           times = await scrapeChronogolfWithPlaywright(course, dates, browser);
