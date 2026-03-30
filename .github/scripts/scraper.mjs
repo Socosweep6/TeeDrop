@@ -1,12 +1,19 @@
 /**
  * TeeDrop Cloud Scraper
  *
- * CPS (Club Prophet Systems): Playwright login → bearer token → direct HTTP for tee times
+ * CPS (Club Prophet Systems):
+ *   1. Direct OAuth login (grant_type=password) to get authenticated token
+ *   2. GetAllOptions via HTTP to build courseId map
+ *   3. Playwright browser session for in-browser fetch (bypasses componentid cookie check)
  * GolfNow: HTTP API (needs GOLFNOW_API_KEY)
  *
- * Oki Golf courses (Newcastle, Harbour Pointe, etc.) removed — they use a
- * waitlist system and have no standard online tee time booking.
- * Chambers Bay moved to GolfNow (facility 4231).
+ * Oki Golf courses removed — they use a waitlist system, no standard online booking.
+ * Chambers Bay on GolfNow (facility 4231).
+ *
+ * CPS env.js discovery:
+ *   AUTH_CLIENT_ID = "js1"
+ *   CLIENT_SECRET  = "v4secret"
+ *   SHORT_LIVED_CLIENT_ID = "onlinereswebshortlived"
  */
 
 import { chromium } from 'playwright';
@@ -74,19 +81,15 @@ function to12Hour(raw) {
   return raw;
 }
 
-// ── CPS: Login → token → direct HTTP ─────────────────────────────────────────
-//
-// Flow:
-//   1. Open a course page with Playwright
-//   2. Submit email on the gate → existing account triggers password step
-//   3. Enter password → OAuth completes → capture bearer token from token/short
-//   4. Call GetAllOptions to build slug→courseId map
-//   5. Fetch tee times via HTTP for each course/date (no more Playwright needed)
+// ── CPS State ─────────────────────────────────────────────────────────────────
 
 let cpsToken = null;
-let cpsCourseIdMap = {};   // cpsSlug → courseId (number)
-let cpsComponentId = null; // required header for GetAvailableTimeSheet
+let cpsCourseIdMap = {};   // cpsSlug → courseId
+let cpsComponentId = null; // from JWT component_id
+let cpsPage = null;        // Playwright page for in-browser fetch (handles cookie auth)
 let cpsInitialized = false;
+
+// ── CPS Init ──────────────────────────────────────────────────────────────────
 
 async function initCps(browser) {
   if (cpsInitialized) return;
@@ -97,253 +100,92 @@ async function initCps(browser) {
     return;
   }
 
-  console.log(`  [CPS] Logging in as ${CPS_EMAIL}...`);
-
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 900 },
-  });
-  const page = await context.newPage();
-
-  // Intercept GetAvailableTimeSheet requests to capture ALL headers the Angular app sends
-  let capturedRequestHeaders = null;
-  await context.route('**GetAvailableTimeSheet**', async (route) => {
-    const req = route.request();
-    capturedRequestHeaders = req.headers();
-    console.log(`  [CPS] Intercepted GetAvailableTimeSheet — headers: ${JSON.stringify(Object.keys(capturedRequestHeaders))}`);
-    const cid = capturedRequestHeaders['componentid'] || capturedRequestHeaders['ComponentId'];
-    if (cid) {
-      cpsComponentId = cid;
-      console.log(`  [CPS] componentid intercepted: ${cid}`);
-    }
-    await route.continue();
-  });
-
-  // Intercept JSON responses to capture token + course options
-  page.on('response', async (response) => {
-    const url = response.url();
-    const ct  = response.headers()['content-type'] || '';
-    if (!ct.includes('json')) return;
-    try {
-      const json = await response.json();
-      if (url.includes('token/short') && json.access_token) {
-        cpsToken = json.access_token;
-        // Log full token/short response (non-token fields)
-        const logFields = Object.fromEntries(Object.entries(json).filter(([k]) => k !== 'access_token' && k !== 'refresh_token'));
-        console.log(`  [CPS] token/short non-token fields: ${JSON.stringify(logFields)}`);
-        try {
-          const payload = JSON.parse(Buffer.from(cpsToken.split('.')[1], 'base64url').toString());
-          console.log(`  [CPS] JWT payload: ${JSON.stringify(payload)}`);
-        } catch { console.log('  [CPS] Bearer token captured'); }
-      }
-      if (url.includes('GetAllOptions')) {
-        // Log top-level keys and first-level structure to find componentid
-        if (typeof json === 'object' && json !== null && !Array.isArray(json)) {
-          // Log shRules[0] values to find siteId
-          if (Array.isArray(json.shRules) && json.shRules.length > 0) {
-            console.log(`  [CPS] shRules[0]: ${JSON.stringify(json.shRules[0])}`);
-          }
-          // Log courseOptions[0] webSiteId and siteId fields
-          if (Array.isArray(json.courseOptions) && json.courseOptions.length > 0) {
-            const c = json.courseOptions[0];
-            console.log(`  [CPS] courseOptions[0] webSiteId: ${c.webSiteId}, courseGUID: ${c.courseGUID}`);
-          }
-        }
-        buildCpsCourseMap(json);
-        console.log(`  [CPS] Course map built: ${Object.keys(cpsCourseIdMap).length} entries`);
-      }
-    } catch { /* ignore */ }
-  });
-
+  // Step 1: Direct OAuth login (no browser needed for auth)
+  console.log(`  [CPS] OAuth login as ${CPS_EMAIL}...`);
   try {
-    // Load Jackson Park — any course page works to trigger the login flow
-    await page.goto('https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
-      { waitUntil: 'networkidle', timeout: 30000 });
-    await sleep(1500);
-
-    // Step 1: Email gate
-    const emailInput = await page.$('input[type="email"], input[formcontrolname="email"], input[name="email"]');
-    if (emailInput) {
-      console.log('  [CPS] Email gate — submitting email');
-      await emailInput.fill(CPS_EMAIL);
-      await page.keyboard.press('Tab');
-      await sleep(400);
-      const nextBtn = await page.$('button[type="submit"], button:has-text("NEXT"), button:has-text("Next"), button:has-text("Continue")');
-      if (nextBtn) await nextBtn.click();
-      await sleep(2000);
-    }
-
-    // Step 2: Password step (may appear inline or via redirect to identityapi)
-    // CPS IdentityServer login page URL pattern: /identityapi/Account/Login or /identityapi/connect/authorize
-    await page.waitForFunction(
-      () => document.querySelector('input[type="password"]') !== null ||
-            document.querySelector('input[name="Password"]') !== null ||
-            document.title.toLowerCase().includes('booking') ||
-            document.querySelector('[class*="tee-time"]') !== null,
-      { timeout: 10000 }
-    ).catch(() => {});
-
-    const passwordInput = await page.$('input[type="password"], input[name="Password"], input[id*="password" i]');
-    if (passwordInput) {
-      console.log(`  [CPS] Password field found at: ${page.url().slice(0, 80)}`);
-      // Fill email again if on a separate login page
-      const loginEmailInput = await page.$('input[type="email"], input[name="Email"], input[id*="email" i], input[name="Username"]');
-      if (loginEmailInput) {
-        const currentVal = await loginEmailInput.inputValue().catch(() => '');
-        if (!currentVal) await loginEmailInput.fill(CPS_EMAIL);
+    const tokenRes = await fetch(
+      'https://premiergolf.cps.golf/identityapi/connect/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'password',
+          username: CPS_EMAIL,
+          password: CPS_PASSWORD,
+          client_id: 'js1',
+          client_secret: 'v4secret',
+          scope: 'onlinereservation references',
+        }),
+        signal: AbortSignal.timeout(15000),
       }
-      await passwordInput.fill(CPS_PASSWORD);
-      await sleep(300);
-      const loginBtn = await page.$('button[type="submit"], button:has-text("Log in"), button:has-text("Sign in"), button:has-text("Login"), input[type="submit"]');
-      if (loginBtn) {
-        console.log(`  [CPS] Clicking login button`);
-        await loginBtn.click();
-      }
-      // Track URL changes through the OAuth flow
-      console.log(`  [CPS] URL after click: ${page.url().slice(0, 120)}`);
-      await sleep(1000);
-      console.log(`  [CPS] URL +1s: ${page.url().slice(0, 120)}`);
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-      console.log(`  [CPS] URL after nav1: ${page.url().slice(0, 120)}`);
-      await sleep(1000);
-      console.log(`  [CPS] URL +1s: ${page.url().slice(0, 120)}`);
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
-      console.log(`  [CPS] URL after nav2: ${page.url().slice(0, 120)}`);
-      await sleep(2000);
-      console.log(`  [CPS] URL final: ${page.url().slice(0, 120)}`);
-      // Check for any error text on the page
-      const errorText = await page.locator('[class*="error"], [class*="alert"], [class*="danger"]').first().textContent().catch(() => '');
-      if (errorText) console.log(`  [CPS] Error on page: ${errorText.slice(0, 200)}`);
-      // If stuck on verify-email, inspect the page and try to proceed
-      if (page.url().includes('verify-email')) {
-        console.log('  [CPS] On verify-email page — getting rendered text...');
-        // Wait for Angular to render the component
-        await sleep(2000);
-        const bodyText = await page.locator('body').innerText().catch(() => '');
-        console.log(`  [CPS] verify-email rendered text: ${bodyText.replace(/\s+/g,' ').slice(0, 500)}`);
-        // Get all button texts
-        const buttons = await page.$$('button, a[role="button"]');
-        for (const btn of buttons) {
-          const txt = await btn.textContent().catch(() => '');
-          if (txt.trim()) console.log(`  [CPS] Button: "${txt.trim()}"`);
-        }
-        // Try clicking any "Continue" / "Already verified" / "Skip" / "Resend" buttons
-        const skipBtn = await page.$('button:has-text("Continue"), button:has-text("Skip"), a:has-text("Continue"), button:has-text("Already"), button:has-text("Resend"), button:has-text("verified")').catch(() => null);
-        if (skipBtn) {
-          const btnText = await skipBtn.textContent().catch(() => 'unknown');
-          console.log(`  [CPS] Clicking: "${btnText}"`);
-          await skipBtn.click();
-          await sleep(3000);
-          console.log(`  [CPS] After click: ${page.url().slice(0, 80)}`);
-        }
-      }
-    } else {
-      console.log('  [CPS] No password field — checking if already past gate');
+    );
+    const tokenJson = await tokenRes.json();
+    if (!tokenJson.access_token) {
+      throw new Error(`Token error: ${JSON.stringify(tokenJson)}`);
     }
+    cpsToken = tokenJson.access_token;
 
-    // Log page state for debugging
-    const title = await page.title().catch(() => '');
-    const url   = page.url();
-    console.log(`  [CPS] Post-login: "${title}" @ ${url.slice(0, 80)}`);
-
-    // If we got the token, fetch GetAllOptions now to get all course IDs
-    if (cpsToken && Object.keys(cpsCourseIdMap).length === 0) {
-      await fetchCpsAllOptions();
+    // Extract component_id from JWT payload
+    try {
+      const payload = JSON.parse(Buffer.from(cpsToken.split('.')[1], 'base64url').toString());
+      cpsComponentId = payload.component_id ? String(payload.component_id) : null;
+      console.log(`  [CPS] Token OK. component_id=${cpsComponentId} sub=${payload.sub}`);
+    } catch {
+      console.log('  [CPS] Token OK (could not decode JWT)');
     }
-
-    // Navigate back to force the Angular app to make GetAvailableTimeSheet calls
-    if (!cpsComponentId) {
-      console.log('  [CPS] Navigating to booking page to intercept GetAvailableTimeSheet...');
-      await page.goto('https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
-        { waitUntil: 'networkidle', timeout: 25000 }).catch(() => {});
-      await sleep(4000);
-      console.log(`  [CPS] componentid after re-nav: ${cpsComponentId || 'not yet'}`);
-    }
-
-    // Try to find componentid in Angular app state / sessionStorage
-    if (!cpsComponentId) {
-      try {
-        const cid = await page.evaluate(() => {
-          // Check sessionStorage
-          for (const key of Object.keys(sessionStorage)) {
-            const val = sessionStorage.getItem(key);
-            if (key.toLowerCase().includes('component') || key.toLowerCase().includes('website') || key.toLowerCase().includes('site')) {
-              return `session:${key}=${val}`;
-            }
-            try {
-              const obj = JSON.parse(val);
-              if (obj && typeof obj === 'object') {
-                const cid = obj.componentId || obj.componentid || obj.component_id || obj.websiteId || obj.siteId;
-                if (cid) return String(cid);
-              }
-            } catch {}
-          }
-          // Check window globals
-          const candidates = ['__componentId', '__websiteId', '__siteId', 'componentId', 'websiteId'];
-          for (const k of candidates) {
-            if (window[k] != null) return String(window[k]);
-          }
-          // Dump all sessionStorage keys + values for debugging
-          const dump = {};
-          for (const key of Object.keys(sessionStorage)) { dump[key] = sessionStorage.getItem(key); }
-          return 'DUMP:' + JSON.stringify(dump).slice(0, 500);
-        });
-        console.log(`  [CPS] page.evaluate result: ${cid}`);
-        if (cid && !cid.startsWith('DUMP:') && !cid.startsWith('session:')) {
-          cpsComponentId = cid;
-        }
-      } catch (err) {
-        console.warn(`  [CPS] page.evaluate error: ${err.message}`);
-      }
-    }
-
   } catch (err) {
-    console.error(`  [CPS] Login error: ${err.message}`);
-  } finally {
-    await context.close();
+    console.error(`  [CPS] OAuth failed: ${err.message}`);
+    cpsInitialized = true;
+    return;
+  }
+
+  // Step 2: Build courseId map via GetAllOptions
+  await fetchCpsAllOptions();
+
+  // Step 3: Launch browser and navigate to CPS site to establish session cookies
+  // The CPS API validates componentid against a session cookie — direct Node.js
+  // fetch always fails. page.evaluate(fetch) uses the browser's cookies.
+  try {
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 900 },
+    });
+    cpsPage = await context.newPage();
+    await cpsPage.goto('https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
+      { waitUntil: 'networkidle', timeout: 30000 });
+    await sleep(2000);
+    console.log(`  [CPS] Browser session established at: ${cpsPage.url().slice(0, 80)}`);
+  } catch (err) {
+    console.error(`  [CPS] Browser setup error: ${err.message}`);
+    cpsPage = null;
   }
 
   cpsInitialized = true;
-  console.log(`  [CPS] Init done. Token: ${cpsToken ? 'YES' : 'NO'} | Courses mapped: ${Object.keys(cpsCourseIdMap).length}`);
+  console.log(`  [CPS] Init done. Token: ${cpsToken ? 'YES' : 'NO'} | Courses: ${Object.keys(cpsCourseIdMap).length} | Browser: ${cpsPage ? 'YES' : 'NO'}`);
 }
 
 async function fetchCpsAllOptions() {
   try {
-    const aoHdrs = { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' };
-    if (cpsComponentId) aoHdrs['componentid'] = cpsComponentId;
     const res = await fetch(
       'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3',
-      { headers: aoHdrs, signal: AbortSignal.timeout(10000) }
+      {
+        headers: { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(15000),
+      }
     );
     if (res.ok) {
       const json = await res.json();
       buildCpsCourseMap(json);
-      console.log(`  [CPS] GetAllOptions (HTTP): ${Object.keys(cpsCourseIdMap).length} courses mapped`);
+      console.log(`  [CPS] GetAllOptions: ${Object.keys(cpsCourseIdMap).length} courses mapped`);
     } else {
       console.log(`  [CPS] GetAllOptions HTTP ${res.status}`);
     }
   } catch (err) {
-    console.warn(`  [CPS] GetAllOptions fetch error: ${err.message}`);
+    console.warn(`  [CPS] GetAllOptions error: ${err.message}`);
   }
 }
 
 function buildCpsCourseMap(options) {
-  // Try to capture componentid from root-level fields
-  if (!cpsComponentId && options && typeof options === 'object' && !Array.isArray(options)) {
-    // Try root webSiteId (GUID)
-    const wid = options.webSiteId || options.websiteId || options.WebSiteId || options.componentId;
-    if (wid && wid !== '00000000-0000-0000-0000-000000000000') {
-      cpsComponentId = String(wid);
-      console.log(`  [CPS] componentid (webSiteId GUID): ${cpsComponentId}`);
-    }
-    // Also log siteId from shRules for debugging
-    if (Array.isArray(options.shRules) && options.shRules.length > 0) {
-      const siteIds = [...new Set(options.shRules.map(r => r.siteId).filter(Boolean))];
-      console.log(`  [CPS] shRules siteIds: ${siteIds.join(', ')}`);
-    }
-  }
-
-  // Walk the entire response tree looking for { courseId, name/courseName }
   const walk = (obj) => {
     if (!obj || typeof obj !== 'object') return;
     if (Array.isArray(obj)) { obj.forEach(walk); return; }
@@ -357,7 +199,6 @@ function buildCpsCourseMap(options) {
 }
 
 function getCpsCourseId(cpsSlug) {
-  // Convert slug to name tokens for fuzzy match
   const tokens = cpsSlug
     .replace(/-golf-course$|-golf-center$|-golf$/, '')
     .split('-')
@@ -371,6 +212,8 @@ function getCpsCourseId(cpsSlug) {
   return null;
 }
 
+// ── CPS Scraper ───────────────────────────────────────────────────────────────
+
 async function scrapeCps(course, dates) {
   if (!cpsToken) {
     console.log(`  [SKIP] No CPS token`);
@@ -380,35 +223,64 @@ async function scrapeCps(course, dates) {
   const courseId = getCpsCourseId(course.cpsSlug);
   if (!courseId) {
     console.log(`  [CPS] No courseId for ${course.cpsSlug}`);
-    console.log(`  [CPS] Known names: ${Object.keys(cpsCourseIdMap).map(k=>k.replace('__name:','')).join(', ')}`);
+    console.log(`  [CPS] Known: ${Object.keys(cpsCourseIdMap).map(k => k.replace('__name:', '')).join(', ')}`);
     return [];
   }
 
-  console.log(`  courseId=${courseId} componentid=${cpsComponentId || 'MISSING'}`);
+  console.log(`  courseId=${courseId} componentid=${cpsComponentId || '?'}`);
   const holeCount = course.holes === 9 ? 9 : 18;
   const results = [];
 
   for (const date of dates) {
     const [y, m, d] = date.split('-');
-    const bookingDate = encodeURIComponent(`${m}/${d}/${y}`);
-    const url = `https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAvailableTimeSheet?tenantAlias=premiergolf&courseId=${courseId}&bookingDate=${bookingDate}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
+    const bookingDate = `${m}/${d}/${y}`;
+    const url = `https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAvailableTimeSheet?tenantAlias=premiergolf&courseId=${courseId}&bookingDate=${encodeURIComponent(bookingDate)}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
 
     try {
-      const hdrs = { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' };
-      if (cpsComponentId) hdrs['componentid'] = cpsComponentId;
-      const res = await fetch(url, {
-        headers: hdrs,
-        signal: AbortSignal.timeout(10000),
-      });
-      const text = await res.text();
+      let status, text;
 
-      if (res.status === 401) {
+      if (cpsPage) {
+        // In-browser fetch: uses session cookies which satisfy the API's auth check
+        const result = await cpsPage.evaluate(
+          async ({ url, token, componentId }) => {
+            try {
+              const res = await fetch(url, {
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'componentid': componentId || '1',
+                  'Accept': 'application/json',
+                },
+              });
+              return { status: res.status, text: await res.text() };
+            } catch (e) {
+              return { status: 0, text: e.message };
+            }
+          },
+          { url, token: cpsToken, componentId: cpsComponentId }
+        );
+        status = result.status;
+        text = result.text;
+      } else {
+        // Fallback: direct Node.js fetch
+        const res = await fetch(url, {
+          headers: {
+            'Authorization': `Bearer ${cpsToken}`,
+            'componentid': cpsComponentId || '1',
+            'Accept': 'application/json',
+          },
+          signal: AbortSignal.timeout(10000),
+        });
+        status = res.status;
+        text = await res.text();
+      }
+
+      if (status === 401) {
         console.log(`  [CPS] 401 — token expired`);
         cpsToken = null;
         break;
       }
-      if (!res.ok) {
-        console.log(`  [CPS] ${date}: HTTP ${res.status} — ${text.slice(0, 100)}`);
+      if (status !== 200) {
+        console.log(`  [CPS] ${date}: HTTP ${status} — ${text.slice(0, 120)}`);
         continue;
       }
 
@@ -514,42 +386,45 @@ async function main() {
   console.log(`GolfNow API key: ${GOLFNOW_API_KEY ? 'SET' : 'NOT SET'}`);
   console.log('');
 
-  // Init CPS session (login + get token + build course map)
   const cpsCourses = COURSES.filter(c => c.bookingSystem === 'cps');
-  if (cpsCourses.length > 0 && (CPS_EMAIL && CPS_PASSWORD)) {
-    console.log('Launching browser for CPS login...');
-    const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-    try {
-      await initCps(browser);
-    } finally {
-      await browser.close();
-    }
+  let browser = null;
+
+  if (cpsCourses.length > 0 && CPS_EMAIL && CPS_PASSWORD) {
+    console.log('Initializing CPS...');
+    browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    await initCps(browser);
     console.log('');
   }
 
   const allTeeTimes = [];
   const stats = { cps: 0, golfnow: 0, golfnowSkipped: 0 };
 
-  for (const course of COURSES) {
-    console.log(`[${course.bookingSystem.toUpperCase()}] ${course.name}`);
-    let times = [];
+  try {
+    for (const course of COURSES) {
+      console.log(`[${course.bookingSystem.toUpperCase()}] ${course.name}`);
+      let times = [];
 
-    try {
-      if (course.bookingSystem === 'cps') {
-        times = await scrapeCps(course, dates);
-        stats.cps += times.length;
-      } else if (course.bookingSystem === 'golfnow') {
-        if (!GOLFNOW_API_KEY) { stats.golfnowSkipped++; }
-        times = await scrapeGolfNow(course, dates);
-        stats.golfnow += times.length;
+      try {
+        if (course.bookingSystem === 'cps') {
+          times = await scrapeCps(course, dates);
+          stats.cps += times.length;
+        } else if (course.bookingSystem === 'golfnow') {
+          if (!GOLFNOW_API_KEY) { stats.golfnowSkipped++; }
+          times = await scrapeGolfNow(course, dates);
+          stats.golfnow += times.length;
+        }
+      } catch (err) {
+        console.error(`  ERROR: ${err.message}`);
       }
-    } catch (err) {
-      console.error(`  ERROR: ${err.message}`);
-    }
 
-    const valid = times.filter(t => t.course && t.date && t.time);
-    console.log(`  → ${valid.length} valid tee times`);
-    allTeeTimes.push(...valid);
+      const valid = times.filter(t => t.course && t.date && t.time);
+      console.log(`  → ${valid.length} valid tee times`);
+      allTeeTimes.push(...valid);
+    }
+  } finally {
+    // Close browser after all scraping is done
+    if (cpsPage) await cpsPage.context().close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 
   console.log('');
