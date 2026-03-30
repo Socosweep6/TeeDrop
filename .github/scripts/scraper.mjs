@@ -199,11 +199,22 @@ async function initCps(browser) {
       // Wait for OAuth redirect back to the booking page
       await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
       await sleep(3000);
-      // If stuck on verify-email, wait longer for auto-redirect
+      // If stuck on verify-email, inspect the page and try to proceed
       if (page.url().includes('verify-email')) {
-        console.log('  [CPS] On verify-email page — waiting for auto-redirect...');
-        await sleep(8000);
-        console.log(`  [CPS] After wait: ${page.url().slice(0, 80)}`);
+        console.log('  [CPS] On verify-email page — dumping content...');
+        const html = await page.content().catch(() => '');
+        console.log(`  [CPS] verify-email content (first 1000): ${html.replace(/\s+/g,' ').slice(0, 1000)}`);
+        // Try clicking any "Continue" / "Already verified" / "Skip" buttons
+        const skipBtn = await page.$('button:has-text("Continue"), button:has-text("Skip"), a:has-text("Continue"), button:has-text("Already"), button:has-text("Resend")').catch(() => null);
+        if (skipBtn) {
+          const btnText = await skipBtn.textContent().catch(() => 'unknown');
+          console.log(`  [CPS] Found button: "${btnText}" — clicking`);
+          await skipBtn.click();
+          await sleep(3000);
+          console.log(`  [CPS] After click: ${page.url().slice(0, 80)}`);
+        } else {
+          console.log('  [CPS] No skip/continue button found on verify-email page');
+        }
       }
     } else {
       console.log('  [CPS] No password field — checking if already past gate');
