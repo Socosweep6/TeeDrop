@@ -105,16 +105,18 @@ async function initCps(browser) {
   });
   const page = await context.newPage();
 
-  // Intercept requests to capture componentid header
-  page.on('request', (request) => {
-    if (request.url().includes('onlinereservation') && !cpsComponentId) {
-      const hdrs = request.headers();
-      const cid = hdrs['componentid'] || hdrs['ComponentId'] || hdrs['component-id'];
-      if (cid) {
-        cpsComponentId = cid;
-        console.log(`  [CPS] componentid captured from request: ${cid}`);
-      }
+  // Intercept GetAvailableTimeSheet requests to capture ALL headers the Angular app sends
+  let capturedRequestHeaders = null;
+  await context.route('**GetAvailableTimeSheet**', async (route) => {
+    const req = route.request();
+    capturedRequestHeaders = req.headers();
+    console.log(`  [CPS] Intercepted GetAvailableTimeSheet — headers: ${JSON.stringify(Object.keys(capturedRequestHeaders))}`);
+    const cid = capturedRequestHeaders['componentid'] || capturedRequestHeaders['ComponentId'];
+    if (cid) {
+      cpsComponentId = cid;
+      console.log(`  [CPS] componentid intercepted: ${cid}`);
     }
+    await route.continue();
   });
 
   // Intercept JSON responses to capture token + course options
@@ -140,18 +142,15 @@ async function initCps(browser) {
       if (url.includes('GetAllOptions')) {
         // Log top-level keys and first-level structure to find componentid
         if (typeof json === 'object' && json !== null && !Array.isArray(json)) {
-          console.log(`  [CPS] GetAllOptions root keys: ${Object.keys(json).join(', ')}`);
-          // Log values of top-level keys that might be the componentid
-          for (const [k, v] of Object.entries(json)) {
-            if (typeof v === 'number' || typeof v === 'string') {
-              console.log(`  [CPS]   ${k}: ${v}`);
-            } else if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
-              console.log(`  [CPS]   ${k}[0] keys: ${Object.keys(v[0]).join(', ')}`);
-            }
+          // Log shRules[0] values to find siteId
+          if (Array.isArray(json.shRules) && json.shRules.length > 0) {
+            console.log(`  [CPS] shRules[0]: ${JSON.stringify(json.shRules[0])}`);
           }
-        } else if (Array.isArray(json) && json.length > 0) {
-          console.log(`  [CPS] GetAllOptions is array, first item keys: ${Object.keys(json[0]).join(', ')}`);
-          console.log(`  [CPS] First item: ${JSON.stringify(json[0]).slice(0, 300)}`);
+          // Log courseOptions[0] webSiteId and siteId fields
+          if (Array.isArray(json.courseOptions) && json.courseOptions.length > 0) {
+            const c = json.courseOptions[0];
+            console.log(`  [CPS] courseOptions[0] webSiteId: ${c.webSiteId}, courseGUID: ${c.courseGUID}`);
+          }
         }
         buildCpsCourseMap(json);
         console.log(`  [CPS] Course map built: ${Object.keys(cpsCourseIdMap).length} entries`);
@@ -215,6 +214,15 @@ async function initCps(browser) {
     // If we got the token, fetch GetAllOptions now to get all course IDs
     if (cpsToken && Object.keys(cpsCourseIdMap).length === 0) {
       await fetchCpsAllOptions();
+    }
+
+    // Navigate back to force the Angular app to make GetAvailableTimeSheet calls
+    if (!cpsComponentId) {
+      console.log('  [CPS] Navigating to booking page to intercept GetAvailableTimeSheet...');
+      await page.goto('https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
+        { waitUntil: 'networkidle', timeout: 25000 }).catch(() => {});
+      await sleep(4000);
+      console.log(`  [CPS] componentid after re-nav: ${cpsComponentId || 'not yet'}`);
     }
 
     // Try to find componentid in Angular app state / sessionStorage
