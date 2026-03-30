@@ -157,7 +157,33 @@ async function initCps(browser) {
     cpsPage = null;
   }
 
-  // Step 3: Build courseId map via GetAllOptions (via browser to get session cookie)
+  // Step 3: Extract anonymous token from browser sessionStorage (set by Angular on page load)
+  // The CPS API uses different tokens per endpoint:
+  //   - GetAllOptions: accepts anonymous (short-lived) token
+  //   - GetAvailableTimeSheet: needs user token (js1)
+  // The anonymous token is stored by the Angular app in sessionStorage.
+  if (cpsPage) {
+    try {
+      const sessionData = await cpsPage.evaluate(() => {
+        const data = {};
+        for (const key of Object.keys(sessionStorage)) {
+          data[key] = sessionStorage.getItem(key);
+        }
+        return data;
+      });
+      console.log(`  [CPS] sessionStorage keys: ${Object.keys(sessionData).join(', ')}`);
+      // Look for the token in various places
+      for (const [k, v] of Object.entries(sessionData)) {
+        if (v && v.length > 100) {
+          console.log(`  [CPS] sessionStorage[${k}] (first 100): ${v.slice(0, 100)}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`  [CPS] sessionStorage read error: ${err.message}`);
+    }
+  }
+
+  // Step 4: Build courseId map via GetAllOptions (via browser to get session cookie)
   await fetchCpsAllOptions();
 
   cpsInitialized = true;
@@ -170,21 +196,22 @@ async function fetchCpsAllOptions() {
     let status, text;
     if (cpsPage) {
       const result = await cpsPage.evaluate(
-        async ({ url, token, componentId }) => {
+        async ({ url, userToken }) => {
           try {
-            const res = await fetch(url, {
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'componentid': componentId || '1',
-                'Accept': 'application/json',
-              },
+            // First try without any Authorization header (let the browser use whatever it has)
+            const r1 = await fetch(url, { headers: { 'Accept': 'application/json' } });
+            if (r1.ok) return { status: r1.status, text: await r1.text(), method: 'no-auth' };
+
+            // Then try with user token
+            const r2 = await fetch(url, {
+              headers: { 'Authorization': `Bearer ${userToken}`, 'Accept': 'application/json' },
             });
-            return { status: res.status, text: await res.text() };
+            return { status: r2.status, text: await r2.text(), method: 'user-token' };
           } catch (e) {
-            return { status: 0, text: e.message };
+            return { status: 0, text: e.message, method: 'error' };
           }
         },
-        { url, token: cpsToken, componentId: cpsComponentId }
+        { url, userToken: cpsToken }
       );
       status = result.status;
       text = result.text;
@@ -200,9 +227,10 @@ async function fetchCpsAllOptions() {
     if (status === 200) {
       const json = JSON.parse(text);
       buildCpsCourseMap(json);
-      console.log(`  [CPS] GetAllOptions: ${Object.keys(cpsCourseIdMap).length} courses mapped`);
+      const method = result && result.method ? result.method : 'http';
+      console.log(`  [CPS] GetAllOptions OK (${method}): ${Object.keys(cpsCourseIdMap).length} courses`);
     } else {
-      console.log(`  [CPS] GetAllOptions HTTP ${status} — ${text.slice(0, 100)}`);
+      console.log(`  [CPS] GetAllOptions HTTP ${status} — ${text.slice(0, 150)}`);
     }
   } catch (err) {
     console.warn(`  [CPS] GetAllOptions error: ${err.message}`);
