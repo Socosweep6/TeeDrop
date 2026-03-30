@@ -128,15 +128,12 @@ async function initCps(browser) {
       const json = await response.json();
       if (url.includes('token/short') && json.access_token) {
         cpsToken = json.access_token;
-        // Try to extract componentid from JWT payload
+        // Log full token/short response (non-token fields)
+        const logFields = Object.fromEntries(Object.entries(json).filter(([k]) => k !== 'access_token' && k !== 'refresh_token'));
+        console.log(`  [CPS] token/short non-token fields: ${JSON.stringify(logFields)}`);
         try {
           const payload = JSON.parse(Buffer.from(cpsToken.split('.')[1], 'base64url').toString());
-          const cid = payload.componentid || payload.ComponentId || payload.component_id
-                   || payload.websiteId   || payload.WebsiteId   || payload.website_id
-                   || payload.siteId      || payload.SiteId;
-          if (cid) { cpsComponentId = String(cid); }
-          console.log(`  [CPS] Bearer token captured. JWT keys: ${Object.keys(payload).join(', ')}`);
-          if (cpsComponentId) console.log(`  [CPS] componentid from JWT: ${cpsComponentId}`);
+          console.log(`  [CPS] JWT payload: ${JSON.stringify(payload)}`);
         } catch { console.log('  [CPS] Bearer token captured'); }
       }
       if (url.includes('GetAllOptions')) {
@@ -201,7 +198,13 @@ async function initCps(browser) {
       if (loginBtn) await loginBtn.click();
       // Wait for OAuth redirect back to the booking page
       await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
-      await sleep(2000);
+      await sleep(3000);
+      // If stuck on verify-email, wait longer for auto-redirect
+      if (page.url().includes('verify-email')) {
+        console.log('  [CPS] On verify-email page — waiting for auto-redirect...');
+        await sleep(8000);
+        console.log(`  [CPS] After wait: ${page.url().slice(0, 80)}`);
+      }
     } else {
       console.log('  [CPS] No password field — checking if already past gate');
     }
@@ -293,12 +296,18 @@ async function fetchCpsAllOptions() {
 }
 
 function buildCpsCourseMap(options) {
-  // Capture webSiteId from root — this is the componentid header required by the API
+  // Try to capture componentid from root-level fields
   if (!cpsComponentId && options && typeof options === 'object' && !Array.isArray(options)) {
+    // Try root webSiteId (GUID)
     const wid = options.webSiteId || options.websiteId || options.WebSiteId || options.componentId;
     if (wid && wid !== '00000000-0000-0000-0000-000000000000') {
       cpsComponentId = String(wid);
-      console.log(`  [CPS] componentid (webSiteId): ${cpsComponentId}`);
+      console.log(`  [CPS] componentid (webSiteId GUID): ${cpsComponentId}`);
+    }
+    // Also log siteId from shRules for debugging
+    if (Array.isArray(options.shRules) && options.shRules.length > 0) {
+      const siteIds = [...new Set(options.shRules.map(r => r.siteId).filter(Boolean))];
+      console.log(`  [CPS] shRules siteIds: ${siteIds.join(', ')}`);
     }
   }
 
