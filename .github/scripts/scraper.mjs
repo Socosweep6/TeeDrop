@@ -172,10 +172,24 @@ async function initCps(browser) {
         return data;
       });
       console.log(`  [CPS] sessionStorage keys: ${Object.keys(sessionData).join(', ')}`);
-      // Look for the token in various places
       for (const [k, v] of Object.entries(sessionData)) {
-        if (v && v.length > 100) {
-          console.log(`  [CPS] sessionStorage[${k}] (first 100): ${v.slice(0, 100)}`);
+        console.log(`  [CPS] ss[${k}]: ${v}`);
+      }
+
+      // Extract SessionId — this appears to be the componentid the API expects
+      if (sessionData.SessionId) {
+        try {
+          const parsed = JSON.parse(sessionData.SessionId);
+          const sid = parsed.value || sessionData.SessionId;
+          if (sid && sid !== '00000000-0000-0000-0000-000000000000') {
+            cpsComponentId = sid;
+            console.log(`  [CPS] componentid from SessionId: ${cpsComponentId}`);
+          }
+        } catch {
+          if (sessionData.SessionId !== '00000000-0000-0000-0000-000000000000') {
+            cpsComponentId = sessionData.SessionId;
+            console.log(`  [CPS] componentid from SessionId (raw): ${cpsComponentId}`);
+          }
         }
       }
     } catch (err) {
@@ -196,22 +210,22 @@ async function fetchCpsAllOptions() {
     let status, text;
     if (cpsPage) {
       const result = await cpsPage.evaluate(
-        async ({ url, userToken }) => {
-          try {
-            // First try without any Authorization header (let the browser use whatever it has)
-            const r1 = await fetch(url, { headers: { 'Accept': 'application/json' } });
-            if (r1.ok) return { status: r1.status, text: await r1.text(), method: 'no-auth' };
+        async ({ url, userToken, sessionId }) => {
+          const hdrs = { 'Accept': 'application/json' };
+          if (sessionId) hdrs['componentid'] = sessionId;
 
-            // Then try with user token
-            const r2 = await fetch(url, {
-              headers: { 'Authorization': `Bearer ${userToken}`, 'Accept': 'application/json' },
-            });
-            return { status: r2.status, text: await r2.text(), method: 'user-token' };
-          } catch (e) {
-            return { status: 0, text: e.message, method: 'error' };
-          }
+          // Try 1: no auth (browser's own anonymous token in sessionStorage)
+          const r1 = await fetch(url, { headers: hdrs }).catch(e => ({ ok: false, status: 0, text: () => e.message }));
+          if (r1.ok) return { status: r1.status, text: await r1.text(), method: 'no-auth' };
+
+          // Try 2: user token
+          const r2 = await fetch(url, {
+            headers: { ...hdrs, 'Authorization': `Bearer ${userToken}` },
+          }).catch(e => ({ ok: false, status: 0, text: () => e.message }));
+          const t2 = typeof r2.text === 'function' ? await r2.text() : r2.text;
+          return { status: r2.status, text: t2, method: 'user-token' };
         },
-        { url, userToken: cpsToken }
+        { url, userToken: cpsToken, sessionId: cpsComponentId }
       );
       status = result.status;
       text = result.text;
