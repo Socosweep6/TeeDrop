@@ -139,12 +139,9 @@ async function initCps(browser) {
     return;
   }
 
-  // Step 2: Build courseId map via GetAllOptions
-  await fetchCpsAllOptions();
-
-  // Step 3: Launch browser and navigate to CPS site to establish session cookies
-  // The CPS API validates componentid against a session cookie — direct Node.js
-  // fetch always fails. page.evaluate(fetch) uses the browser's cookies.
+  // Step 2: Launch browser and establish session cookies
+  // ALL CPS API calls must go through page.evaluate(fetch) — the API validates a
+  // session cookie that only exists in the browser context.
   try {
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -154,31 +151,58 @@ async function initCps(browser) {
     await cpsPage.goto('https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
       { waitUntil: 'networkidle', timeout: 30000 });
     await sleep(2000);
-    console.log(`  [CPS] Browser session established at: ${cpsPage.url().slice(0, 80)}`);
+    console.log(`  [CPS] Browser session at: ${cpsPage.url().slice(0, 80)}`);
   } catch (err) {
     console.error(`  [CPS] Browser setup error: ${err.message}`);
     cpsPage = null;
   }
+
+  // Step 3: Build courseId map via GetAllOptions (via browser to get session cookie)
+  await fetchCpsAllOptions();
 
   cpsInitialized = true;
   console.log(`  [CPS] Init done. Token: ${cpsToken ? 'YES' : 'NO'} | Courses: ${Object.keys(cpsCourseIdMap).length} | Browser: ${cpsPage ? 'YES' : 'NO'}`);
 }
 
 async function fetchCpsAllOptions() {
+  const url = 'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3';
   try {
-    const res = await fetch(
-      'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3',
-      {
+    let status, text;
+    if (cpsPage) {
+      const result = await cpsPage.evaluate(
+        async ({ url, token, componentId }) => {
+          try {
+            const res = await fetch(url, {
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'componentid': componentId || '1',
+                'Accept': 'application/json',
+              },
+            });
+            return { status: res.status, text: await res.text() };
+          } catch (e) {
+            return { status: 0, text: e.message };
+          }
+        },
+        { url, token: cpsToken, componentId: cpsComponentId }
+      );
+      status = result.status;
+      text = result.text;
+    } else {
+      const res = await fetch(url, {
         headers: { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' },
         signal: AbortSignal.timeout(15000),
-      }
-    );
-    if (res.ok) {
-      const json = await res.json();
+      });
+      status = res.status;
+      text = await res.text();
+    }
+
+    if (status === 200) {
+      const json = JSON.parse(text);
       buildCpsCourseMap(json);
       console.log(`  [CPS] GetAllOptions: ${Object.keys(cpsCourseIdMap).length} courses mapped`);
     } else {
-      console.log(`  [CPS] GetAllOptions HTTP ${res.status}`);
+      console.log(`  [CPS] GetAllOptions HTTP ${status} — ${text.slice(0, 100)}`);
     }
   } catch (err) {
     console.warn(`  [CPS] GetAllOptions error: ${err.message}`);
