@@ -85,6 +85,7 @@ function to12Hour(raw) {
 
 let cpsToken = null;
 let cpsCourseIdMap = {};   // cpsSlug → courseId (number)
+let cpsComponentId = null; // required header for GetAvailableTimeSheet
 let cpsInitialized = false;
 
 async function initCps(browser) {
@@ -104,6 +105,18 @@ async function initCps(browser) {
   });
   const page = await context.newPage();
 
+  // Intercept requests to capture componentid header
+  page.on('request', (request) => {
+    if (request.url().includes('onlinereservation') && !cpsComponentId) {
+      const hdrs = request.headers();
+      const cid = hdrs['componentid'] || hdrs['ComponentId'] || hdrs['component-id'];
+      if (cid) {
+        cpsComponentId = cid;
+        console.log(`  [CPS] componentid captured from request: ${cid}`);
+      }
+    }
+  });
+
   // Intercept JSON responses to capture token + course options
   page.on('response', async (response) => {
     const url = response.url();
@@ -113,7 +126,16 @@ async function initCps(browser) {
       const json = await response.json();
       if (url.includes('token/short') && json.access_token) {
         cpsToken = json.access_token;
-        console.log('  [CPS] Bearer token captured');
+        // Try to extract componentid from JWT payload
+        try {
+          const payload = JSON.parse(Buffer.from(cpsToken.split('.')[1], 'base64url').toString());
+          const cid = payload.componentid || payload.ComponentId || payload.component_id
+                   || payload.websiteId   || payload.WebsiteId   || payload.website_id
+                   || payload.siteId      || payload.SiteId;
+          if (cid) { cpsComponentId = String(cid); }
+          console.log(`  [CPS] Bearer token captured. JWT keys: ${Object.keys(payload).join(', ')}`);
+          if (cpsComponentId) console.log(`  [CPS] componentid from JWT: ${cpsComponentId}`);
+        } catch { console.log('  [CPS] Bearer token captured'); }
       }
       if (url.includes('GetAllOptions')) {
         buildCpsCourseMap(json);
@@ -180,6 +202,15 @@ async function initCps(browser) {
       await fetchCpsAllOptions();
     }
 
+    // Navigate to the booking page to trigger GetAvailableTimeSheet and capture componentid
+    if (cpsToken && !cpsComponentId) {
+      console.log('  [CPS] Navigating to booking page to capture componentid...');
+      await page.goto('https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
+        { waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
+      await sleep(3000);
+      console.log(`  [CPS] componentid after nav: ${cpsComponentId || 'not captured'}`);
+    }
+
   } catch (err) {
     console.error(`  [CPS] Login error: ${err.message}`);
   } finally {
@@ -192,9 +223,11 @@ async function initCps(browser) {
 
 async function fetchCpsAllOptions() {
   try {
+    const aoHdrs = { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' };
+    if (cpsComponentId) aoHdrs['componentid'] = cpsComponentId;
     const res = await fetch(
       'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3',
-      { headers: { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' }, signal: AbortSignal.timeout(10000) }
+      { headers: aoHdrs, signal: AbortSignal.timeout(10000) }
     );
     if (res.ok) {
       const json = await res.json();
@@ -250,7 +283,7 @@ async function scrapeCps(course, dates) {
     return [];
   }
 
-  console.log(`  courseId=${courseId}`);
+  console.log(`  courseId=${courseId} componentid=${cpsComponentId || 'MISSING'}`);
   const holeCount = course.holes === 9 ? 9 : 18;
   const results = [];
 
@@ -260,8 +293,10 @@ async function scrapeCps(course, dates) {
     const url = `https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAvailableTimeSheet?tenantAlias=premiergolf&courseId=${courseId}&bookingDate=${bookingDate}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
 
     try {
+      const hdrs = { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' };
+      if (cpsComponentId) hdrs['componentid'] = cpsComponentId;
       const res = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' },
+        headers: hdrs,
         signal: AbortSignal.timeout(10000),
       });
       const text = await res.text();
