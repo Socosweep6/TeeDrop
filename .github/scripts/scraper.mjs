@@ -285,6 +285,15 @@ async function fetchCpsAllOptions() {
 }
 
 function buildCpsCourseMap(options) {
+  // Capture webSiteId from root — this is the componentid header required by the API
+  if (!cpsComponentId && options && typeof options === 'object' && !Array.isArray(options)) {
+    const wid = options.webSiteId || options.websiteId || options.WebSiteId || options.componentId;
+    if (wid && wid !== '00000000-0000-0000-0000-000000000000') {
+      cpsComponentId = String(wid);
+      console.log(`  [CPS] componentid (webSiteId): ${cpsComponentId}`);
+    }
+  }
+
   // Walk the entire response tree looking for { courseId, name/courseName }
   const walk = (obj) => {
     if (!obj || typeof obj !== 'object') return;
