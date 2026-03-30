@@ -138,8 +138,23 @@ async function initCps(browser) {
         } catch { console.log('  [CPS] Bearer token captured'); }
       }
       if (url.includes('GetAllOptions')) {
+        // Log top-level keys and first-level structure to find componentid
+        if (typeof json === 'object' && json !== null && !Array.isArray(json)) {
+          console.log(`  [CPS] GetAllOptions root keys: ${Object.keys(json).join(', ')}`);
+          // Log values of top-level keys that might be the componentid
+          for (const [k, v] of Object.entries(json)) {
+            if (typeof v === 'number' || typeof v === 'string') {
+              console.log(`  [CPS]   ${k}: ${v}`);
+            } else if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
+              console.log(`  [CPS]   ${k}[0] keys: ${Object.keys(v[0]).join(', ')}`);
+            }
+          }
+        } else if (Array.isArray(json) && json.length > 0) {
+          console.log(`  [CPS] GetAllOptions is array, first item keys: ${Object.keys(json[0]).join(', ')}`);
+          console.log(`  [CPS] First item: ${JSON.stringify(json[0]).slice(0, 300)}`);
+        }
         buildCpsCourseMap(json);
-        console.log(`  [CPS] Course map: ${JSON.stringify(cpsCourseIdMap)}`);
+        console.log(`  [CPS] Course map built: ${Object.keys(cpsCourseIdMap).length} entries`);
       }
     } catch { /* ignore */ }
   });
@@ -202,13 +217,41 @@ async function initCps(browser) {
       await fetchCpsAllOptions();
     }
 
-    // Navigate to the booking page to trigger GetAvailableTimeSheet and capture componentid
-    if (cpsToken && !cpsComponentId) {
-      console.log('  [CPS] Navigating to booking page to capture componentid...');
-      await page.goto('https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
-        { waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
-      await sleep(3000);
-      console.log(`  [CPS] componentid after nav: ${cpsComponentId || 'not captured'}`);
+    // Try to find componentid in Angular app state / sessionStorage
+    if (!cpsComponentId) {
+      try {
+        const cid = await page.evaluate(() => {
+          // Check sessionStorage
+          for (const key of Object.keys(sessionStorage)) {
+            const val = sessionStorage.getItem(key);
+            if (key.toLowerCase().includes('component') || key.toLowerCase().includes('website') || key.toLowerCase().includes('site')) {
+              return `session:${key}=${val}`;
+            }
+            try {
+              const obj = JSON.parse(val);
+              if (obj && typeof obj === 'object') {
+                const cid = obj.componentId || obj.componentid || obj.component_id || obj.websiteId || obj.siteId;
+                if (cid) return String(cid);
+              }
+            } catch {}
+          }
+          // Check window globals
+          const candidates = ['__componentId', '__websiteId', '__siteId', 'componentId', 'websiteId'];
+          for (const k of candidates) {
+            if (window[k] != null) return String(window[k]);
+          }
+          // Dump all sessionStorage keys + values for debugging
+          const dump = {};
+          for (const key of Object.keys(sessionStorage)) { dump[key] = sessionStorage.getItem(key); }
+          return 'DUMP:' + JSON.stringify(dump).slice(0, 500);
+        });
+        console.log(`  [CPS] page.evaluate result: ${cid}`);
+        if (cid && !cid.startsWith('DUMP:') && !cid.startsWith('session:')) {
+          cpsComponentId = cid;
+        }
+      } catch (err) {
+        console.warn(`  [CPS] page.evaluate error: ${err.message}`);
+      }
     }
 
   } catch (err) {
