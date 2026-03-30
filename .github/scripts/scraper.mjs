@@ -201,19 +201,25 @@ async function initCps(browser) {
       await sleep(3000);
       // If stuck on verify-email, inspect the page and try to proceed
       if (page.url().includes('verify-email')) {
-        console.log('  [CPS] On verify-email page — dumping content...');
-        const html = await page.content().catch(() => '');
-        console.log(`  [CPS] verify-email content (first 1000): ${html.replace(/\s+/g,' ').slice(0, 1000)}`);
-        // Try clicking any "Continue" / "Already verified" / "Skip" buttons
-        const skipBtn = await page.$('button:has-text("Continue"), button:has-text("Skip"), a:has-text("Continue"), button:has-text("Already"), button:has-text("Resend")').catch(() => null);
+        console.log('  [CPS] On verify-email page — getting rendered text...');
+        // Wait for Angular to render the component
+        await sleep(2000);
+        const bodyText = await page.locator('body').innerText().catch(() => '');
+        console.log(`  [CPS] verify-email rendered text: ${bodyText.replace(/\s+/g,' ').slice(0, 500)}`);
+        // Get all button texts
+        const buttons = await page.$$('button, a[role="button"]');
+        for (const btn of buttons) {
+          const txt = await btn.textContent().catch(() => '');
+          if (txt.trim()) console.log(`  [CPS] Button: "${txt.trim()}"`);
+        }
+        // Try clicking any "Continue" / "Already verified" / "Skip" / "Resend" buttons
+        const skipBtn = await page.$('button:has-text("Continue"), button:has-text("Skip"), a:has-text("Continue"), button:has-text("Already"), button:has-text("Resend"), button:has-text("verified")').catch(() => null);
         if (skipBtn) {
           const btnText = await skipBtn.textContent().catch(() => 'unknown');
-          console.log(`  [CPS] Found button: "${btnText}" — clicking`);
+          console.log(`  [CPS] Clicking: "${btnText}"`);
           await skipBtn.click();
           await sleep(3000);
           console.log(`  [CPS] After click: ${page.url().slice(0, 80)}`);
-        } else {
-          console.log('  [CPS] No skip/continue button found on verify-email page');
         }
       }
     } else {
