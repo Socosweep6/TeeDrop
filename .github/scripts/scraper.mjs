@@ -185,7 +185,7 @@ async function initCps(browser) {
 
     const passwordInput = await page.$('input[type="password"], input[name="Password"], input[id*="password" i]');
     if (passwordInput) {
-      console.log('  [CPS] Password field found — logging in');
+      console.log(`  [CPS] Password field found at: ${page.url().slice(0, 80)}`);
       // Fill email again if on a separate login page
       const loginEmailInput = await page.$('input[type="email"], input[name="Email"], input[id*="email" i], input[name="Username"]');
       if (loginEmailInput) {
@@ -195,10 +195,25 @@ async function initCps(browser) {
       await passwordInput.fill(CPS_PASSWORD);
       await sleep(300);
       const loginBtn = await page.$('button[type="submit"], button:has-text("Log in"), button:has-text("Sign in"), button:has-text("Login"), input[type="submit"]');
-      if (loginBtn) await loginBtn.click();
-      // Wait for OAuth redirect back to the booking page
-      await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
-      await sleep(3000);
+      if (loginBtn) {
+        console.log(`  [CPS] Clicking login button`);
+        await loginBtn.click();
+      }
+      // Track URL changes through the OAuth flow
+      console.log(`  [CPS] URL after click: ${page.url().slice(0, 120)}`);
+      await sleep(1000);
+      console.log(`  [CPS] URL +1s: ${page.url().slice(0, 120)}`);
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+      console.log(`  [CPS] URL after nav1: ${page.url().slice(0, 120)}`);
+      await sleep(1000);
+      console.log(`  [CPS] URL +1s: ${page.url().slice(0, 120)}`);
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
+      console.log(`  [CPS] URL after nav2: ${page.url().slice(0, 120)}`);
+      await sleep(2000);
+      console.log(`  [CPS] URL final: ${page.url().slice(0, 120)}`);
+      // Check for any error text on the page
+      const errorText = await page.locator('[class*="error"], [class*="alert"], [class*="danger"]').first().textContent().catch(() => '');
+      if (errorText) console.log(`  [CPS] Error on page: ${errorText.slice(0, 200)}`);
       // If stuck on verify-email, inspect the page and try to proceed
       if (page.url().includes('verify-email')) {
         console.log('  [CPS] On verify-email page — getting rendered text...');
