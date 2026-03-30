@@ -31,4 +31,6 @@ jobs:
           INGEST_URL: ${{ secrets.INGEST_URL }}
           INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
           GOLFNOW_API_KEY: ${{ secrets.GOLFNOW_API_KEY }}
+          CPS_EMAIL: ${{ secrets.CPS_EMAIL }}
+          CPS_PASSWORD: ${{ secrets.CPS_PASSWORD }}
         run: node .github/scripts/scraper.mjs
