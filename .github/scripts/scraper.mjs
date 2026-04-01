@@ -206,7 +206,24 @@ async function initCps(browser) {
       sleep(5000),
     ]);
 
-    console.log(`  [CPS] Browser session at: ${cpsPage.url().slice(0, 80)}`);
+    const landedUrl = cpsPage.url();
+    console.log(`  [CPS] Browser session at: ${landedUrl.slice(0, 120)}`);
+
+    // If redirected to verify-email, try navigating to the returnUrl (search page)
+    // The search/booking page may call GetAvailableTimeSheet anonymously
+    if (landedUrl.includes('verify-email')) {
+      const returnMatch = landedUrl.match(/returnUrl=([^&]+)/);
+      if (returnMatch) {
+        const returnUrl = decodeURIComponent(returnMatch[1]);
+        console.log(`  [CPS] Redirected to verify-email. Trying returnUrl: ${returnUrl.slice(0, 80)}`);
+        try {
+          await cpsPage.goto(`https://premiergolf.cps.golf/onlineresweb${returnUrl}`,
+            { waitUntil: 'networkidle', timeout: 15000 });
+          console.log(`  [CPS] After returnUrl nav: ${cpsPage.url().slice(0, 80)}`);
+          await sleep(2000);
+        } catch {}
+      }
+    }
   } catch (err) {
     console.error(`  [CPS] Browser setup error: ${err.message}`);
     cpsPage = null;
@@ -376,13 +393,25 @@ async function scrapeCps(course, dates) {
     const base = 'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation';
     const qs = `courseId=${courseId}&bookingDate=${encodeURIComponent(bookingDate)}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
 
+    const saleBase = 'https://premiergolf.cps.golf/onlineres/saleapi/api/v1/sale';
+    const qsWithProduct = `${qs}&product=3`;
     // URL candidates — try each until one succeeds or we exhaust them
     // On subsequent dates, jump straight to the one that worked
     const urlCandidates = workingUrlTemplate
       ? [workingUrlTemplate.replace('__DATE__', encodeURIComponent(bookingDate))]
       : [
+          // Tenant in path (matching GetAllOptions pattern) + product param
+          `${base}/GetAvailableTimeSheet/premiergolf?${qsWithProduct}`,
+          // Tenant in path, no product
           `${base}/GetAvailableTimeSheet/premiergolf?${qs}`,
+          // Tenant as query param
           `${base}/GetAvailableTimeSheet?tenantAlias=premiergolf&${qs}`,
+          // Different endpoint names under onlineApi
+          `${base}/GetAvailableTimes/premiergolf?${qs}`,
+          `${base}/GetTeeSheet/premiergolf?${qs}`,
+          // Under saleApi
+          `${saleBase}/GetAvailableTimeSheet/premiergolf?${qs}`,
+          // With websiteId
           `${base}/GetAvailableTimeSheet/premiergolf?${qs}&websiteId=fbe1de5b-8700-4db9-d7d2-08da3ce0bbaa`,
         ];
 
