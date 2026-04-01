@@ -91,6 +91,9 @@ let cpsInitialized = false;
 
 // ── CPS Init ──────────────────────────────────────────────────────────────────
 
+// Headers captured from Angular app's own successful API calls
+let cpsAngularHeaders = null;
+
 async function initCps(browser) {
   if (cpsInitialized) return;
 
@@ -125,7 +128,7 @@ async function initCps(browser) {
     }
     cpsToken = tokenJson.access_token;
 
-    // Extract component_id from JWT payload
+    // Extract component_id from JWT payload (fallback only)
     try {
       const payload = JSON.parse(Buffer.from(cpsToken.split('.')[1], 'base64url').toString());
       cpsComponentId = payload.component_id ? String(payload.component_id) : null;
@@ -139,29 +142,71 @@ async function initCps(browser) {
     return;
   }
 
-  // Step 2: Launch browser and establish session cookies
-  // ALL CPS API calls must go through page.evaluate(fetch) — the API validates a
-  // session cookie that only exists in the browser context.
+  // Step 2: Launch browser, intercept Angular's own API calls to capture real headers
+  // Angular's requests succeed because they include a valid componentid + session cookies.
+  // We intercept to capture the exact headers, then reuse them.
   try {
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       viewport: { width: 1280, height: 900 },
     });
     cpsPage = await context.newPage();
+
+    // Intercept Angular's GetAllOptions request BEFORE navigation
+    const allOptionsPromise = new Promise((resolve) => {
+      cpsPage.on('request', req => {
+        if (req.url().includes('GetAllOptions')) {
+          const headers = req.headers();
+          console.log(`  [CPS] Intercepted Angular GetAllOptions request:`);
+          for (const [k, v] of Object.entries(headers)) {
+            console.log(`    ${k}: ${v.slice(0, 100)}`);
+          }
+          cpsAngularHeaders = headers;
+          if (headers['componentid']) {
+            cpsComponentId = headers['componentid'];
+            console.log(`  [CPS] componentid from Angular request: ${cpsComponentId}`);
+          }
+          resolve(headers);
+        }
+      });
+
+      // Also capture response data from Angular's GetAllOptions
+      cpsPage.on('response', async resp => {
+        if (resp.url().includes('GetAllOptions') && resp.status() === 200) {
+          try {
+            const data = await resp.json();
+            buildCpsCourseMap(data);
+            console.log(`  [CPS] GetAllOptions captured from Angular (${Object.keys(cpsCourseIdMap).length} courses)`);
+          } catch {}
+        } else if (resp.url().includes('GetAllOptions')) {
+          console.log(`  [CPS] Angular GetAllOptions → HTTP ${resp.status()}`);
+        }
+      });
+    });
+
     await cpsPage.goto('https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
       { waitUntil: 'networkidle', timeout: 30000 });
-    await sleep(2000);
+
+    // Give Angular a moment if networkidle wasn't enough
+    await Promise.race([
+      allOptionsPromise,
+      sleep(5000),
+    ]);
+
     console.log(`  [CPS] Browser session at: ${cpsPage.url().slice(0, 80)}`);
   } catch (err) {
     console.error(`  [CPS] Browser setup error: ${err.message}`);
     cpsPage = null;
   }
 
-  // Step 3: Extract anonymous token from browser sessionStorage (set by Angular on page load)
-  // The CPS API uses different tokens per endpoint:
-  //   - GetAllOptions: accepts anonymous (short-lived) token
-  //   - GetAvailableTimeSheet: needs user token (js1)
-  // The anonymous token is stored by the Angular app in sessionStorage.
+  // Step 3: If Angular's request didn't fire or we didn't get courses, try direct call
+  // using the componentid we captured (or fall back to JWT value)
+  if (Object.keys(cpsCourseIdMap).length === 0) {
+    console.log(`  [CPS] No courses from Angular intercept — trying direct GetAllOptions`);
+    await fetchCpsAllOptions();
+  }
+
+  // Step 4: Dump full sessionStorage for debugging
   if (cpsPage) {
     try {
       const sessionData = await cpsPage.evaluate(() => {
@@ -173,48 +218,57 @@ async function initCps(browser) {
       });
       console.log(`  [CPS] sessionStorage keys: ${Object.keys(sessionData).join(', ')}`);
       for (const [k, v] of Object.entries(sessionData)) {
-        console.log(`  [CPS] ss[${k}]: ${v}`);
-      }
-
-      // Extract SessionId — this appears to be the componentid the API expects
-      if (sessionData.SessionId) {
-        try {
-          const parsed = JSON.parse(sessionData.SessionId);
-          const sid = parsed.value || sessionData.SessionId;
-          if (sid && sid !== '00000000-0000-0000-0000-000000000000') {
-            cpsComponentId = sid;
-            console.log(`  [CPS] componentid from SessionId: ${cpsComponentId}`);
-          }
-        } catch {
-          if (sessionData.SessionId !== '00000000-0000-0000-0000-000000000000') {
-            cpsComponentId = sessionData.SessionId;
-            console.log(`  [CPS] componentid from SessionId (raw): ${cpsComponentId}`);
-          }
-        }
+        console.log(`  [CPS] ss[${k}]: ${String(v).slice(0, 120)}`);
       }
     } catch (err) {
       console.warn(`  [CPS] sessionStorage read error: ${err.message}`);
     }
   }
 
-  // Step 4: Build courseId map via GetAllOptions (via browser to get session cookie)
-  await fetchCpsAllOptions();
-
   cpsInitialized = true;
-  console.log(`  [CPS] Init done. Token: ${cpsToken ? 'YES' : 'NO'} | Courses: ${Object.keys(cpsCourseIdMap).length} | Browser: ${cpsPage ? 'YES' : 'NO'}`);
+  console.log(`  [CPS] Init done. Token: ${cpsToken ? 'YES' : 'NO'} | componentid: ${cpsComponentId || 'UNKNOWN'} | Courses: ${Object.keys(cpsCourseIdMap).length} | Browser: ${cpsPage ? 'YES' : 'NO'}`);
 }
 
 async function fetchCpsAllOptions() {
   const url = 'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3';
   try {
-    let status, text;
+    // Use captured Angular headers if available — replicate them exactly
+    if (cpsAngularHeaders && cpsPage) {
+      const result = await cpsPage.evaluate(
+        async ({ url, angularHeaders, userToken }) => {
+          // Try 1: replicate Angular's exact headers (captured from its own request)
+          const hdrs1 = { ...angularHeaders };
+          // Swap in our auth token
+          hdrs1['authorization'] = `Bearer ${userToken}`;
+          const r1 = await fetch(url, { headers: hdrs1 }).catch(e => ({ ok: false, status: 0, statusText: e.message }));
+          if (r1.ok) return { status: r1.status, text: await r1.text(), method: 'angular-headers+auth' };
+
+          // Try 2: Angular headers without auth swap (use whatever token Angular had)
+          const r2 = await fetch(url, { headers: angularHeaders }).catch(e => ({ ok: false, status: 0, statusText: e.message }));
+          if (r2.ok) return { status: r2.status, text: await r2.text(), method: 'angular-headers-as-is' };
+
+          const t2 = typeof r2.text === 'function' ? await r2.text() : (r2.statusText || '');
+          return { status: r2.status, text: t2, method: 'angular-headers-as-is' };
+        },
+        { url, angularHeaders: cpsAngularHeaders, userToken: cpsToken }
+      );
+      if (result.status === 200) {
+        const json = JSON.parse(result.text);
+        buildCpsCourseMap(json);
+        console.log(`  [CPS] GetAllOptions OK (${result.method}): ${Object.keys(cpsCourseIdMap).length} courses`);
+        return;
+      }
+      console.log(`  [CPS] GetAllOptions HTTP ${result.status} (${result.method}) — ${result.text.slice(0, 150)}`);
+    }
+
+    // Fallback: try in-browser with componentid from JWT / sessionStorage
     if (cpsPage) {
       const result = await cpsPage.evaluate(
         async ({ url, userToken, sessionId }) => {
           const hdrs = { 'Accept': 'application/json' };
           if (sessionId) hdrs['componentid'] = sessionId;
 
-          // Try 1: no auth (browser's own anonymous token in sessionStorage)
+          // Try 1: no auth
           const r1 = await fetch(url, { headers: hdrs }).catch(e => ({ ok: false, status: 0, text: () => e.message }));
           if (r1.ok) return { status: r1.status, text: await r1.text(), method: 'no-auth' };
 
@@ -222,29 +276,30 @@ async function fetchCpsAllOptions() {
           const r2 = await fetch(url, {
             headers: { ...hdrs, 'Authorization': `Bearer ${userToken}` },
           }).catch(e => ({ ok: false, status: 0, text: () => e.message }));
-          const t2 = typeof r2.text === 'function' ? await r2.text() : r2.text;
+          const t2 = typeof r2.text === 'function' ? await r2.text() : (r2.statusText || '');
           return { status: r2.status, text: t2, method: 'user-token' };
         },
         { url, userToken: cpsToken, sessionId: cpsComponentId }
       );
-      status = result.status;
-      text = result.text;
+      if (result.status === 200) {
+        const json = JSON.parse(result.text);
+        buildCpsCourseMap(json);
+        console.log(`  [CPS] GetAllOptions OK (${result.method}): ${Object.keys(cpsCourseIdMap).length} courses`);
+        return;
+      }
+      console.log(`  [CPS] GetAllOptions HTTP ${result.status} (${result.method}) — ${result.text.slice(0, 150)}`);
     } else {
       const res = await fetch(url, {
         headers: { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' },
         signal: AbortSignal.timeout(15000),
       });
-      status = res.status;
-      text = await res.text();
-    }
-
-    if (status === 200) {
-      const json = JSON.parse(text);
-      buildCpsCourseMap(json);
-      const method = result && result.method ? result.method : 'http';
-      console.log(`  [CPS] GetAllOptions OK (${method}): ${Object.keys(cpsCourseIdMap).length} courses`);
-    } else {
-      console.log(`  [CPS] GetAllOptions HTTP ${status} — ${text.slice(0, 150)}`);
+      const text = await res.text();
+      if (res.status === 200) {
+        buildCpsCourseMap(JSON.parse(text));
+        console.log(`  [CPS] GetAllOptions OK (direct): ${Object.keys(cpsCourseIdMap).length} courses`);
+      } else {
+        console.log(`  [CPS] GetAllOptions HTTP ${res.status} (direct) — ${text.slice(0, 150)}`);
+      }
     }
   } catch (err) {
     console.warn(`  [CPS] GetAllOptions error: ${err.message}`);
@@ -306,23 +361,31 @@ async function scrapeCps(course, dates) {
       let status, text;
 
       if (cpsPage) {
-        // In-browser fetch: uses session cookies which satisfy the API's auth check
+        // In-browser fetch: replicate Angular's headers (incl. componentid), swap in auth token
         const result = await cpsPage.evaluate(
-          async ({ url, token, componentId }) => {
+          async ({ url, token, componentId, angularHeaders }) => {
             try {
-              const res = await fetch(url, {
-                headers: {
+              // Build headers: start from Angular's captured headers if available,
+              // otherwise use componentid we know about
+              let hdrs;
+              if (angularHeaders) {
+                hdrs = { ...angularHeaders };
+                hdrs['authorization'] = `Bearer ${token}`;
+                hdrs['accept'] = 'application/json';
+              } else {
+                hdrs = {
                   'Authorization': `Bearer ${token}`,
                   'componentid': componentId || '1',
                   'Accept': 'application/json',
-                },
-              });
+                };
+              }
+              const res = await fetch(url, { headers: hdrs });
               return { status: res.status, text: await res.text() };
             } catch (e) {
               return { status: 0, text: e.message };
             }
           },
-          { url, token: cpsToken, componentId: cpsComponentId }
+          { url, token: cpsToken, componentId: cpsComponentId, angularHeaders: cpsAngularHeaders }
         );
         status = result.status;
         text = result.text;
