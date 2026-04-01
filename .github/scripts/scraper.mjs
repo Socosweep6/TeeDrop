@@ -152,19 +152,32 @@ async function initCps(browser) {
     });
     cpsPage = await context.newPage();
 
-    // Intercept Angular's GetAllOptions request BEFORE navigation
+    // Intercept ALL Angular onlinereservation requests BEFORE navigation
+    // This captures the exact URLs and headers the app uses successfully
     const allOptionsPromise = new Promise((resolve) => {
       cpsPage.on('request', req => {
-        if (req.url().includes('GetAllOptions')) {
+        const url = req.url();
+        if (url.includes('onlinereservation')) {
           const headers = req.headers();
-          console.log(`  [CPS] Intercepted Angular GetAllOptions request:`);
+          // Log ALL reservation API requests to understand URL patterns
+          const shortUrl = url.replace('https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation', '[api]');
+          console.log(`  [CPS] Angular request: ${shortUrl.slice(0, 150)}`);
+          const cidKey = Object.keys(headers).find(k => k.toLowerCase().includes('componentid'));
+          if (cidKey) {
+            console.log(`    ${cidKey}: ${headers[cidKey]}`);
+          }
+        }
+        if (url.includes('GetAllOptions')) {
+          const headers = req.headers();
+          console.log(`  [CPS] Intercepted Angular GetAllOptions headers:`);
           for (const [k, v] of Object.entries(headers)) {
             console.log(`    ${k}: ${v.slice(0, 100)}`);
           }
           cpsAngularHeaders = headers;
-          if (headers['componentid']) {
-            cpsComponentId = headers['componentid'];
-            console.log(`  [CPS] componentid from Angular request: ${cpsComponentId}`);
+          const cidKey = Object.keys(headers).find(k => k.toLowerCase().includes('componentid'));
+          if (cidKey) {
+            cpsComponentId = headers[cidKey];
+            console.log(`  [CPS] componentid header name="${cidKey}" value="${cpsComponentId}"`);
           }
           resolve(headers);
         }
@@ -355,7 +368,8 @@ async function scrapeCps(course, dates) {
   for (const date of dates) {
     const [y, m, d] = date.split('-');
     const bookingDate = `${m}/${d}/${y}`;
-    const url = `https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAvailableTimeSheet?tenantAlias=premiergolf&courseId=${courseId}&bookingDate=${encodeURIComponent(bookingDate)}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
+    // Try tenant-in-path format (same pattern as GetAllOptions/premiergolf)
+    const url = `https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAvailableTimeSheet/premiergolf?courseId=${courseId}&bookingDate=${encodeURIComponent(bookingDate)}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
 
     try {
       let status, text;
@@ -420,7 +434,7 @@ async function scrapeCps(course, dates) {
     } catch (err) {
       console.warn(`  [CPS] ${date}: ${err.message}`);
     }
-    await sleep(150);
+    await sleep(500); // 500ms between requests — CPS rate limit is 10/s but we share quota
   }
 
   return results;
