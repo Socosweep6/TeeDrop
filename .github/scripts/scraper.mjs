@@ -385,7 +385,7 @@ async function scrapeCps(course, dates) {
   console.log(`  courseId=${courseId} componentid=${cpsComponentId || '?'}`);
   const holeCount = course.holes === 9 ? 9 : 18;
   const results = [];
-  let workingUrlTemplate = null; // set on first success so subsequent dates skip probing
+  let workingUrlTemplate = null;
 
   for (const date of dates) {
     const [y, m, d] = date.split('-');
@@ -393,86 +393,39 @@ async function scrapeCps(course, dates) {
     const base = 'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation';
     const qs = `courseId=${courseId}&bookingDate=${encodeURIComponent(bookingDate)}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
 
-    const saleBase = 'https://premiergolf.cps.golf/onlineres/saleapi/api/v1/sale';
-    const qsWithProduct = `${qs}&product=3`;
-    // URL candidates — try each until one succeeds or we exhaust them
-    // On subsequent dates, jump straight to the one that worked
-    const urlCandidates = workingUrlTemplate
-      ? [workingUrlTemplate.replace('__DATE__', encodeURIComponent(bookingDate))]
-      : [
-          // Tenant in path (matching GetAllOptions pattern) + product param
-          `${base}/GetAvailableTimeSheet/premiergolf?${qsWithProduct}`,
-          // Tenant in path, no product
-          `${base}/GetAvailableTimeSheet/premiergolf?${qs}`,
-          // Tenant as query param
-          `${base}/GetAvailableTimeSheet?tenantAlias=premiergolf&${qs}`,
-          // Different endpoint names under onlineApi
-          `${base}/GetAvailableTimes/premiergolf?${qs}`,
-          `${base}/GetTeeSheet/premiergolf?${qs}`,
-          // Under saleApi
-          `${saleBase}/GetAvailableTimeSheet/premiergolf?${qs}`,
-          // With websiteId
-          `${base}/GetAvailableTimeSheet/premiergolf?${qs}&websiteId=fbe1de5b-8700-4db9-d7d2-08da3ce0bbaa`,
-        ];
+    // URL is confirmed: tenant-in-path format, matching GetAllOptions pattern
+    // product=3 is included based on GetAllOptions URL pattern
+    const url = workingUrlTemplate
+      ? workingUrlTemplate.replace('__DATE__', encodeURIComponent(bookingDate))
+      : `${base}/GetAvailableTimeSheet/premiergolf?${qs}&product=3`;
 
     try {
-      let status = 0, text = '';
-      let usedUrl = '';
+      let status, text;
 
-      for (const url of urlCandidates) {
-        const result = cpsPage
-          ? await cpsPage.evaluate(
-              async ({ url, token, angularHeaders }) => {
-                try {
-                  // Try 1: with auth token
-                  let hdrs = angularHeaders ? { ...angularHeaders } : {};
-                  hdrs['authorization'] = `Bearer ${token}`;
-                  hdrs['accept'] = 'application/json';
-                  let res = await fetch(url, { headers: hdrs });
-                  let txt = await res.text();
-                  if (res.status !== 404) return { status: res.status, text: txt };
-
-                  // Try 2: without auth (anonymous, like GetAllOptions)
-                  const hdrs2 = angularHeaders ? { ...angularHeaders } : { 'x-componentid': '1' };
-                  hdrs2['accept'] = 'application/json';
-                  delete hdrs2['authorization'];
-                  res = await fetch(url, { headers: hdrs2 });
-                  txt = await res.text();
-                  return { status: res.status, text: txt, anon: true };
-                } catch (e) {
-                  return { status: 0, text: e.message };
-                }
-              },
-              { url, token: cpsToken, angularHeaders: cpsAngularHeaders }
-            )
-          : await (async () => {
-              const res = await fetch(url, {
-                headers: { 'Authorization': `Bearer ${cpsToken}`, 'x-componentid': cpsComponentId || '1', 'Accept': 'application/json' },
-                signal: AbortSignal.timeout(10000),
-              });
+      if (cpsPage) {
+        const result = await cpsPage.evaluate(
+          async ({ url, token, angularHeaders }) => {
+            try {
+              const hdrs = angularHeaders ? { ...angularHeaders } : {};
+              hdrs['authorization'] = `Bearer ${token}`;
+              hdrs['accept'] = 'application/json';
+              const res = await fetch(url, { headers: hdrs });
               return { status: res.status, text: await res.text() };
-            })();
-
-        // Log first date probe attempts in detail
-        if (!workingUrlTemplate) {
-          const shortUrl = url.replace(base, '[api]');
-          console.log(`  [CPS] probe ${shortUrl.slice(0, 100)} → HTTP ${result.status} body=${result.text.slice(0, 80) || '(empty)'}`);
-        }
-
-        if (result.status !== 404) {
-          status = result.status;
-          text = result.text;
-          usedUrl = url;
-          if (result.status === 200 && !workingUrlTemplate) {
-            // Store template for future dates
-            const template = url.replace(encodeURIComponent(bookingDate), '__DATE__');
-            workingUrlTemplate = template;
-            console.log(`  [CPS] Working URL template: ${template.replace(base, '[api]')}`);
-          }
-          break;
-        }
+            } catch (e) {
+              return { status: 0, text: e.message };
+            }
+          },
+          { url, token: cpsToken, angularHeaders: cpsAngularHeaders }
+        );
         status = result.status;
         text = result.text;
+      } else {
+        const res = await fetch(url, {
+          headers: { 'Authorization': `Bearer ${cpsToken}`, 'x-componentid': cpsComponentId || '1', 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(10000),
+        });
+        status = res.status;
+        text = await res.text();
       }
 
       if (status === 401) {
@@ -481,12 +434,11 @@ async function scrapeCps(course, dates) {
         break;
       }
       if (status !== 200) {
-        if (!workingUrlTemplate) {
-          console.log(`  [CPS] ${date}: all URL formats → HTTP ${status} — ${text.slice(0, 120)}`);
-        } else {
-          console.log(`  [CPS] ${date}: HTTP ${status} — ${text.slice(0, 120)}`);
-        }
+        console.log(`  [CPS] ${date}: HTTP ${status} — ${text.slice(0, 120) || '(empty body)'}`);
         continue;
+      }
+      if (!workingUrlTemplate) {
+        workingUrlTemplate = url.replace(encodeURIComponent(bookingDate), '__DATE__');
       }
 
       const json = JSON.parse(text);
