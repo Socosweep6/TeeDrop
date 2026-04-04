@@ -1,9 +1,20 @@
-import { COURSES } from './courses.js';
+/**
+ * scraper.js — for Chester (the mini PC scraper), NOT Vercel
+ *
+ * This file lives here for reference. Actual scraping runs on Chester
+ * (the dedicated mini PC at 100.104.98.54) because GolfNow and Chronogolf
+ * block server-side requests from Vercel's IP ranges.
+ *
+ * Chester scrapes courses and POSTs results to /api/ingest on TeeDrop.
+ * Import path on Chester: adjust to match Chester's directory structure.
+ */
+
+import { COURSES } from '../lib/courses.js';
 
 // Scrape tee times from GolfNow for a specific course and date
 async function scrapeGolfNow(course, date, players = 4) {
   const teeTimes = [];
-  
+
   try {
     // GolfNow uses a POST endpoint for tee time results
     const url = `https://www.golfnow.com/api/tee-times/tee-time-results`;
@@ -38,35 +49,35 @@ async function scrapeGolfNow(course, date, players = 4) {
     }
 
     const data = await res.json();
-    
+
     // Parse the response - GolfNow returns tee times in various structures
-    const results = data?.TeeTimeResults || data?.ttResults || data?.Results || 
+    const results = data?.TeeTimeResults || data?.ttResults || data?.Results ||
                     data?.teeTimeResults || data?.results || [];
-    
+
     if (Array.isArray(results)) {
       for (const tt of results) {
         const time = tt.Time || tt.time || tt.teeTime || tt.StartTime || '';
-        const price = tt.DisplayRate || tt.Price || tt.price || tt.DisplayPrice || 
+        const price = tt.DisplayRate || tt.Price || tt.price || tt.DisplayPrice ||
                       tt.GreenFee || tt.greenFee || '';
         const holes = tt.Holes || tt.holes || 18;
-        const spots = tt.PlayerRule?.MaxPlayers || tt.MaxPlayers || tt.maxPlayers || 
+        const spots = tt.PlayerRule?.MaxPlayers || tt.MaxPlayers || tt.maxPlayers ||
                       tt.AvailableSpots || players;
-        
+
         // Handle nested rates array
         const rates = tt.Rates || tt.rates || [];
         const bestRate = rates[0];
         const ratePrice = bestRate?.DisplayRate || bestRate?.Price || bestRate?.price || price;
-        
+
         const timeStr = typeof time === 'string' ? time : '';
-        
+
         if (timeStr) {
           teeTimes.push({
             course: course.name,
             date: date,
             time: formatTime(timeStr),
             players: spots,
-            price: typeof ratePrice === 'number' ? `$${ratePrice.toFixed(2)}` : 
-                   (typeof ratePrice === 'string' && ratePrice) ? 
+            price: typeof ratePrice === 'number' ? `$${ratePrice.toFixed(2)}` :
+                   (typeof ratePrice === 'string' && ratePrice) ?
                    (ratePrice.startsWith('$') ? ratePrice : `$${ratePrice}`) : 'N/A',
             holes: holes,
             bookingUrl: `https://www.golfnow.com/tee-times/facility/${course.golfnowId}/search#date=${date}`,
@@ -75,7 +86,7 @@ async function scrapeGolfNow(course, date, players = 4) {
         }
       }
     }
-    
+
     console.log(`GolfNow ${course.name} (${date}): found ${teeTimes.length} tee times`);
   } catch (error) {
     console.log(`GolfNow scrape error for ${course.name} (${date}): ${error.message}`);
@@ -84,13 +95,13 @@ async function scrapeGolfNow(course, date, players = 4) {
   return teeTimes;
 }
 
-// Fallback: scrape from GolfNow's HTML search page 
+// Fallback: scrape from GolfNow's HTML search page
 async function scrapeGolfNowHtml(course, date, players = 4) {
   const teeTimes = [];
-  
+
   try {
     const url = `https://www.golfnow.com/tee-times/facility/${course.golfnowId}-${course.name.toLowerCase().replace(/\s+/g, '-')}/search#date=${date}&players=${players}`;
-    
+
     const res = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
@@ -102,16 +113,16 @@ async function scrapeGolfNowHtml(course, date, players = 4) {
     if (!res.ok) return teeTimes;
 
     const html = await res.text();
-    
+
     // Extract tee time data from embedded JSON in the page
     const jsonMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({.*?});/s) ||
                       html.match(/"teeTimeResults"\s*:\s*(\[.*?\])/s);
-    
+
     if (jsonMatch) {
       try {
         const data = JSON.parse(jsonMatch[1]);
         const results = data?.teeTimeResults || data?.ttResults || (Array.isArray(data) ? data : []);
-        
+
         for (const tt of results) {
           if (tt.time || tt.teeTime) {
             teeTimes.push({
@@ -193,13 +204,11 @@ async function scrapeChronogolf(course, date, players = 4) {
 
 function formatTime(timeStr) {
   if (!timeStr) return '';
-  // Handle various time formats
   if (timeStr.includes('AM') || timeStr.includes('PM')) return timeStr;
   if (timeStr.includes('T')) {
     const d = new Date(timeStr);
     return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
   }
-  // HH:MM format
   const [h, m] = timeStr.split(':').map(Number);
   const ampm = h >= 12 ? 'PM' : 'AM';
   const hour = h % 12 || 12;
@@ -208,21 +217,18 @@ function formatTime(timeStr) {
 
 function formatChronogolfTime(timeStr) {
   if (!timeStr) return '';
-  // Chronogolf times might be ISO or HH:MM
   if (timeStr.includes('T')) {
-    return new Date(timeStr).toLocaleTimeString('en-US', { 
+    return new Date(timeStr).toLocaleTimeString('en-US', {
       hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/Los_Angeles'
     });
   }
   return formatTime(timeStr);
 }
 
-// Generate dates between start and end (inclusive)
 function getDateRange(startDate, endDate) {
   const dates = [];
   const start = new Date(startDate + 'T00:00:00');
   const end = new Date(endDate + 'T00:00:00');
-  
   for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
     dates.push(d.toISOString().split('T')[0]);
   }
@@ -237,21 +243,14 @@ export async function scrapeTeeTimes(courseNames, startDate, endDate, players = 
 
   console.log(`Scraping ${coursesToScrape.length} courses for ${dates.length} dates...`);
 
-  // Process sequentially with small delays to avoid rate limiting
   for (const course of coursesToScrape) {
     for (const date of dates) {
       try {
-        // Try GolfNow first
         let results = await scrapeGolfNow(course, date, players);
-        
-        // If no GolfNow results, try Chronogolf
         if (results.length === 0 && course.chronogolfSlug) {
           results = await scrapeChronogolf(course, date, players);
         }
-        
         allTeeTimes.push(...results);
-        
-        // Small delay between requests
         await new Promise(r => setTimeout(r, 200));
       } catch (e) {
         console.log(`Error scraping ${course.name} for ${date}: ${e.message}`);

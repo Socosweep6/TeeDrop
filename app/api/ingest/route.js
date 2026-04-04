@@ -23,10 +23,9 @@ export async function POST(request) {
       return NextResponse.json({ error: 'No tee times provided. Send { teeTimes: [...] }' }, { status: 400 });
     }
 
-    // Validate and insert tee times
     let inserted = 0;
     let skipped = 0;
-    const newTeeTimes = []; // Track genuinely new ones for alerts
+    const newTeeTimes = []; // Truly new records, with their DB ids for alert dedup
 
     for (const tt of teeTimes) {
       if (!tt.course || !tt.date || !tt.time) {
@@ -34,7 +33,6 @@ export async function POST(request) {
         continue;
       }
 
-      // Ensure booking URL - use course config as fallback
       const bookingUrl = tt.booking_url || tt.bookingUrl || getBookingUrl(tt.course, tt.date);
 
       try {
@@ -56,7 +54,7 @@ export async function POST(request) {
           });
           inserted++;
         } else {
-          await prisma.teeTime.create({
+          const created = await prisma.teeTime.create({
             data: {
               course: tt.course,
               date: tt.date,
@@ -70,7 +68,8 @@ export async function POST(request) {
             },
           });
           inserted++;
-          newTeeTimes.push({ ...tt, bookingUrl }); // Only truly new for alerts
+          // Track new tee times with their DB id for alert deduplication
+          newTeeTimes.push({ ...tt, bookingUrl, id: created.id });
         }
       } catch (e) {
         console.error(`Ingest error for ${tt.course} ${tt.date} ${tt.time}:`, e.message);
@@ -85,10 +84,7 @@ export async function POST(request) {
         const usersWithAlerts = await prisma.user.findMany({
           where: {
             settings: {
-              OR: [
-                { alertEmail: true },
-                { alertSms: true },
-              ],
+              OR: [{ alertEmail: true }, { alertSms: true }],
             },
           },
           include: { settings: true },
@@ -96,29 +92,73 @@ export async function POST(request) {
 
         for (const user of usersWithAlerts) {
           if (!user.settings) continue;
-
-          // Skip if user is in quiet hours
           if (isQuietHours(user.settings)) continue;
+
+          // Bug 6: skip non-instant frequency users
+          // hourly/daily users will get batched alerts via a separate cron job (TODO)
+          const freq = user.settings.alertFrequency || 'instant';
+          if (freq !== 'instant') continue;
 
           const matching = newTeeTimes.filter(tt =>
             matchesUserPreferences(tt, user.settings)
           );
-
           if (matching.length === 0) continue;
 
-          // Send email alert
+          const teeTimeIds = matching.map(tt => tt.id);
+
+          // Email alert
           if (user.settings.alertEmail) {
             const email = user.settings.alertEmailAddress || user.email;
             if (email) {
-              const sent = await sendEmailAlert(email, matching.slice(0, 10));
-              if (sent) alertsSent++;
+              // Bug 3: dedup — skip tee times already alerted via email
+              const alreadySent = await prisma.alert.findMany({
+                where: { userId: user.id, teeTimeId: { in: teeTimeIds }, method: 'email' },
+                select: { teeTimeId: true },
+              });
+              const sentIds = new Set(alreadySent.map(a => a.teeTimeId));
+              const toAlert = matching.filter(tt => !sentIds.has(tt.id));
+
+              if (toAlert.length > 0) {
+                const sent = await sendEmailAlert(email, toAlert.slice(0, 10));
+                if (sent) {
+                  alertsSent++;
+                  // Bug 2: save alert records
+                  await prisma.alert.createMany({
+                    data: toAlert.slice(0, 10).map(tt => ({
+                      userId: user.id,
+                      teeTimeId: tt.id,
+                      method: 'email',
+                    })),
+                  });
+                }
+              }
             }
           }
 
-          // Send SMS alert (premium+ only)
+          // SMS alert (premium+ only)
           if (user.settings.alertSms && user.phone && user.tier !== 'free') {
-            const sent = await sendSmsAlert(user.phone, matching.slice(0, 5));
-            if (sent) alertsSent++;
+            // Bug 3: dedup — skip tee times already alerted via SMS
+            const alreadySent = await prisma.alert.findMany({
+              where: { userId: user.id, teeTimeId: { in: teeTimeIds }, method: 'sms' },
+              select: { teeTimeId: true },
+            });
+            const sentIds = new Set(alreadySent.map(a => a.teeTimeId));
+            const toAlert = matching.filter(tt => !sentIds.has(tt.id));
+
+            if (toAlert.length > 0) {
+              const sent = await sendSmsAlert(user.phone, toAlert.slice(0, 5));
+              if (sent) {
+                alertsSent++;
+                // Bug 2: save alert records
+                await prisma.alert.createMany({
+                  data: toAlert.slice(0, 5).map(tt => ({
+                    userId: user.id,
+                    teeTimeId: tt.id,
+                    method: 'sms',
+                  })),
+                });
+              }
+            }
           }
         }
       } catch (e) {
@@ -153,12 +193,10 @@ export async function DELETE(request) {
   }
 
   try {
-    // Delete tee times older than today
     const today = new Date().toISOString().split('T')[0];
     const result = await prisma.teeTime.deleteMany({
       where: { date: { lt: today } },
     });
-
     return NextResponse.json({ message: 'Cleanup complete', deleted: result.count });
   } catch (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
@@ -175,24 +213,22 @@ export async function GET(request) {
   }
 
   const count = await prisma.teeTime.count();
-  
+
   return NextResponse.json({
     message: 'TeeDrop Ingest API',
     teeTimesInDb: count,
     usage: 'POST /api/ingest?secret=<secret>',
     format: {
-      teeTimes: [
-        {
-          course: 'Jackson Park Golf Course',
-          date: '2026-03-29',
-          time: '7:30 AM',
-          players: 4,
-          price: '$45.00',
-          holes: 18,
-          booking_url: 'https://...',
-          source: 'chronogolf',
-        },
-      ],
+      teeTimes: [{
+        course: 'Jackson Park Golf Course',
+        date: '2026-04-05',
+        time: '7:30 AM',
+        players: 4,
+        price: '$45.00',
+        holes: 18,
+        booking_url: 'https://...',
+        source: 'chronogolf',
+      }],
     },
   });
 }
