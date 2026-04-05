@@ -15,13 +15,6 @@ function GoogleIcon() {
   );
 }
 
-function FacebookIcon() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-      <path d="M18 9a9 9 0 1 0-10.406 8.892V11.61H5.31V9h2.284V7.017c0-2.255 1.343-3.502 3.4-3.502.985 0 2.015.176 2.015.176v2.215h-1.135c-1.118 0-1.467.694-1.467 1.406V9h2.496l-.399 2.61H10.41v6.282A9.003 9.003 0 0 0 18 9z" fill="#1877F2"/>
-    </svg>
-  );
-}
 
 export default function SignupPage() {
   const router = useRouter();
@@ -95,14 +88,6 @@ export default function SignupPage() {
           >
             <GoogleIcon />
             {oauthLoading === 'google' ? 'Redirecting...' : 'Continue with Google'}
-          </button>
-          <button
-            onClick={() => handleOAuth('facebook')}
-            disabled={!!oauthLoading}
-            className="w-full flex items-center justify-center gap-3 py-3 px-4 bg-[#1877F2] border border-[#1877F2] rounded-xl text-sm font-semibold text-white hover:bg-[#166ee1] active:scale-95 transition-all disabled:opacity-50"
-          >
-            <FacebookIcon />
-            {oauthLoading === 'facebook' ? 'Redirecting...' : 'Continue with Facebook'}
           </button>
         </div>
 
