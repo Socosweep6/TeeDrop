@@ -25,55 +25,76 @@ export async function POST(request) {
 
     let inserted = 0;
     let skipped = 0;
-    const newTeeTimes = []; // Truly new records, with their DB ids for alert dedup
+    let newTeeTimes = []; // Truly new records, with their DB ids for alert dedup
 
-    for (const tt of teeTimes) {
-      if (!tt.course || !tt.date || !tt.time) {
-        skipped++;
-        continue;
-      }
+    // Filter out malformed records up front
+    const valid = teeTimes.filter(tt => tt.course && tt.date && tt.time);
+    skipped = teeTimes.length - valid.length;
 
-      const bookingUrl = tt.booking_url || tt.bookingUrl || getBookingUrl(tt.course, tt.date);
+    // Group by (course, date) so we can bulk-query each group
+    const groups = new Map();
+    for (const tt of valid) {
+      const key = `${tt.course}|${tt.date}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(tt);
+    }
+
+    for (const [, group] of groups) {
+      const { course, date } = group[0];
 
       try {
-        const existing = await prisma.teeTime.findFirst({
-          where: { course: tt.course, date: tt.date, time: tt.time },
+        // 1 query: get all existing records for this course+date
+        const existing = await prisma.teeTime.findMany({
+          where: { course, date },
+          select: { id: true, time: true },
         });
+        const existingByTime = new Map(existing.map(r => [r.time, r.id]));
 
-        if (existing) {
-          await prisma.teeTime.update({
-            where: { id: existing.id },
-            data: {
-              players: tt.players || existing.players,
-              price: tt.price || existing.price,
-              holes: tt.holes || existing.holes,
-              bookingUrl: bookingUrl || existing.bookingUrl,
-              source: tt.source || existing.source,
-              scrapedAt: new Date(),
-            },
-          });
-          inserted++;
-        } else {
-          const created = await prisma.teeTime.create({
-            data: {
+        const toCreate = group.filter(tt => !existingByTime.has(tt.time));
+        const toUpdateIds = existing.map(r => r.id);
+
+        // 1 query: bulk insert new records
+        if (toCreate.length > 0) {
+          await prisma.teeTime.createMany({
+            data: toCreate.map(tt => ({
               course: tt.course,
               date: tt.date,
               time: tt.time,
               players: tt.players || 4,
               price: tt.price || null,
               holes: tt.holes || 18,
-              bookingUrl: bookingUrl || null,
+              bookingUrl: tt.booking_url || tt.bookingUrl || getBookingUrl(tt.course, tt.date) || null,
               source: tt.source || 'scraper',
               scrapedAt: new Date(),
-            },
+            })),
+            skipDuplicates: true,
           });
-          inserted++;
-          // Track new tee times with their DB id for alert deduplication
-          newTeeTimes.push({ ...tt, bookingUrl, id: created.id });
+        }
+
+        // 1 query: refresh scrapedAt on existing records
+        if (toUpdateIds.length > 0) {
+          await prisma.teeTime.updateMany({
+            where: { id: { in: toUpdateIds } },
+            data: { scrapedAt: new Date() },
+          });
+        }
+
+        inserted += group.length;
+
+        // Fetch newly created records (need DB ids for alert dedup)
+        if (toCreate.length > 0) {
+          const created = await prisma.teeTime.findMany({
+            where: { course, date, time: { in: toCreate.map(t => t.time) } },
+          });
+          newTeeTimes = newTeeTimes.concat(created.map(r => ({
+            ...toCreate.find(t => t.time === r.time),
+            id: r.id,
+            bookingUrl: r.bookingUrl,
+          })));
         }
       } catch (e) {
-        console.error(`Ingest error for ${tt.course} ${tt.date} ${tt.time}:`, e.message);
-        skipped++;
+        console.error(`Ingest bulk error for ${course} ${date}:`, e.message);
+        skipped += group.length;
       }
     }
 
