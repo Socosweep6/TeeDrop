@@ -131,13 +131,31 @@ async function scrapeGolfNow(course, date) {
 
 async function scrapeChronogolf(course, date) {
   if (!course.chronogolfSlug) return [];
+  // Skip courses with no online booking — they use CPS or another system
+  if (!course.affiliationTypeId) return [];
   try {
-    const url = `https://www.chronogolf.com/marketplace/clubs/${course.chronogolfSlug}/teetimes?date=${date}&nb_holes=18&affiliation_type_ids=`;
+    // First get a session cookie to pass Cloudflare
+    let cookieStr = '';
+    try {
+      const pageRes = await fetch(`https://www.chronogolf.com/club/${course.chronogolfSlug}`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml',
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      const rawCookies = pageRes.headers.get('set-cookie') || '';
+      cookieStr = rawCookies.split(',').map(c => c.split(';')[0]).join('; ');
+    } catch { /* continue without cookie */ }
+
+    const url = `https://www.chronogolf.com/marketplace/clubs/${course.chronogolfSlug}/teetimes?date=${date}&nb_holes=18&affiliation_type_ids=${course.affiliationTypeId}`;
     const res = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json',
         'X-Requested-With': 'XMLHttpRequest',
+        'Cookie': cookieStr,
+        'Referer': `https://www.chronogolf.com/club/${course.chronogolfSlug}`,
       },
       signal: AbortSignal.timeout(10000),
     });
@@ -184,20 +202,23 @@ async function scrapeChronogolf(course, date) {
 
 async function ingest(teeTimes) {
   if (teeTimes.length === 0) return;
-  try {
-    const res = await fetch(INGEST_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-ingest-secret': INGEST_SECRET,
-      },
-      body: JSON.stringify({ teeTimes }),
-      signal: AbortSignal.timeout(30000),
-    });
-    const data = await res.json();
-    console.log(`  → Ingest: ${res.status}`, data.inserted ?? data.message ?? '');
-  } catch (err) {
-    console.log(`  → Ingest error: ${err.message}`);
+  const CHUNK = 15;  // keep each Vercel call under 30s
+  const url = INGEST_URL.includes('?') ? `${INGEST_URL}&secret=${INGEST_SECRET}` : `${INGEST_URL}?secret=${INGEST_SECRET}`;
+  for (let i = 0; i < teeTimes.length; i += CHUNK) {
+    const chunk = teeTimes.slice(i, i + CHUNK);
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ teeTimes: chunk }),
+        signal: AbortSignal.timeout(45000),
+      });
+      const data = await res.json();
+      process.stdout.write(`  → Ingest [${i}–${i + chunk.length}]: ${res.status} (${data.inserted ?? '?'} inserted)\n`);
+    } catch (err) {
+      console.log(`  → Ingest error [${i}–${i + chunk.length}]: ${err.message}`);
+    }
+    await delay(200);
   }
 }
 
@@ -231,14 +252,16 @@ async function main() {
         continue;
       }
 
+      if (results.length > 0) {
+        // Ingest immediately per day-course to stay within Vercel's 30s limit
+        await ingest(results);
+        totalIngested += results.length;
+      }
       batch.push(...results);
       totalFound += results.length;
-      await delay(300);
+      await delay(1200);  // generous delay to avoid Cloudflare rate limiting
     }
 
-    // Ingest per course to avoid huge payloads
-    await ingest(batch);
-    totalIngested += batch.length;
     await delay(500);
   }
 
