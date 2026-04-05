@@ -239,15 +239,27 @@ async function processCourse(course, dates) {
 async function main() {
   const dates = getDateRange(DAYS_AHEAD);
   const start = Date.now();
-  console.log(`TeeDrop scraper — ${dates.length} days × ${COURSES.length} courses (concurrency: ${CONCURRENCY})`);
+  console.log(`TeeDrop scraper — ${dates.length} days × ${COURSES.length} courses`);
   console.log(`Ingest: ${INGEST_URL}\n`);
 
   let total = 0;
-  const results = await withConcurrency(COURSES, CONCURRENCY, async course => {
+
+  // Chronogolf courses share a domain — run sequentially to avoid Cloudflare rate limits
+  const chronogolfCourses = COURSES.filter(c => c.bookingSystem === 'chronogolf');
+  const otherCourses = COURSES.filter(c => c.bookingSystem !== 'chronogolf');
+
+  // GolfNow + CPS can run in parallel (different domains / fast skips)
+  await withConcurrency(otherCourses, CONCURRENCY, async course => {
     const found = await processCourse(course, dates);
     total += found.length;
-    return found.length;
   });
+
+  // Chronogolf sequential — one course at a time, brief pause between courses
+  for (const course of chronogolfCourses) {
+    const found = await processCourse(course, dates);
+    total += found.length;
+    await delay(2000);  // cooldown between Chronogolf courses
+  }
 
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
   console.log(`\n✓ Done in ${elapsed}s — ${total} tee times across ${COURSES.length} courses`);
