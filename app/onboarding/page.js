@@ -19,6 +19,7 @@ const COURSE_GROUPS = [
     region: 'North',
     courses: [
       'Legion Memorial Golf Course',
+      'Walter E. Hall Memorial Golf Course',
       'Harbour Pointe Golf Club',
       'Battle Creek Golf Course',
     ],
@@ -30,6 +31,7 @@ const COURSE_GROUPS = [
       'Willows Run Golf Complex',
       'Golf Club at Newcastle',
       'Redmond Ridge Golf Course',
+      'Snoqualmie Falls Golf Course',
     ],
   },
   {
@@ -40,6 +42,9 @@ const COURSE_GROUPS = [
       'Foster Golf Links',
       'Riverbend Golf Complex',
       'Maplewood Golf Course',
+      'Auburn Golf Course',
+      'Trophy Lake Golf & Casting',
+      'Madrona Links Golf Course',
       'Chambers Bay',
     ],
   },

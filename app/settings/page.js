@@ -21,6 +21,7 @@ const COURSE_GROUPS = [
     region: 'North',
     courses: [
       'Legion Memorial Golf Course',
+      'Walter E. Hall Memorial Golf Course',
       'Harbour Pointe Golf Club',
       'Battle Creek Golf Course',
     ],
@@ -32,6 +33,7 @@ const COURSE_GROUPS = [
       'Willows Run Golf Complex',
       'Golf Club at Newcastle',
       'Redmond Ridge Golf Course',
+      'Snoqualmie Falls Golf Course',
     ],
   },
   {
@@ -42,6 +44,9 @@ const COURSE_GROUPS = [
       'Foster Golf Links',
       'Riverbend Golf Complex',
       'Maplewood Golf Course',
+      'Auburn Golf Course',
+      'Trophy Lake Golf & Casting',
+      'Madrona Links Golf Course',
       'Chambers Bay',
     ],
   },
@@ -160,7 +165,7 @@ export default function SettingsPage() {
       <div className="sticky top-0 z-40 px-5 py-3.5 bg-white border-b border-gray-100 flex items-center justify-between">
         <a href="/dashboard" className="text-sm text-gray-500 font-medium">← Back</a>
         <h1 className="text-base font-bold text-gray-900">Settings</h1>
-        <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full capitalize font-medium">{tier}</span>
+        <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium">{tier === 'allaccess' ? 'All Access' : tier === 'premium' ? 'Premium' : 'Free'}</span>
       </div>
 
       <div className="px-4 py-5 pb-28 max-w-lg mx-auto w-full space-y-6">

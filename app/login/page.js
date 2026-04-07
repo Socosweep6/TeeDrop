@@ -15,7 +15,6 @@ function GoogleIcon() {
   );
 }
 
-
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -47,88 +46,117 @@ function LoginForm() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 px-5 py-12">
-      {/* Brand */}
-      <div className="text-center mb-8">
-        <a href="/" className="inline-flex items-center gap-2">
-          <span className="text-3xl">⛳</span>
-          <span className="text-3xl font-bold text-primary">TeeDrop</span>
-        </a>
-        <p className="text-gray-500 text-sm mt-1.5">Seattle golf tee time alerts</p>
+    <div className="min-h-screen flex bg-[#fafaf8]">
+      {/* Left panel — decorative, hidden on mobile */}
+      <div className="hidden lg:flex lg:w-[45%] bg-[#0f4c2a] flex-col justify-between p-12 relative overflow-hidden">
+        {/* Dot grid texture */}
+        <div
+          className="absolute inset-0 opacity-[0.06]"
+          style={{ backgroundImage: 'radial-gradient(circle at 1px 1px, white 1px, transparent 0)', backgroundSize: '22px 22px' }}
+        />
+        {/* Top brand */}
+        <div className="relative z-10 flex items-center gap-2.5">
+          <span className="text-2xl">⛳</span>
+          <span className="text-xl font-bold text-white">TeeDrop</span>
+        </div>
+        {/* Center copy */}
+        <div className="relative z-10">
+          <p className="text-green-300 text-xs font-bold uppercase tracking-widest mb-4">Seattle golf alerts</p>
+          <h2 className="text-4xl font-bold text-white leading-tight mb-6">
+            Never miss a<br />
+            <span className="text-green-300">prime tee time</span><br />
+            again.
+          </h2>
+          <p className="text-white/60 text-sm leading-relaxed max-w-xs">
+            We monitor 20+ courses and text you the moment your preferred times open up.
+          </p>
+        </div>
+        {/* Bottom stat */}
+        <div className="relative z-10">
+          <p className="text-white/40 text-xs">Monitoring 20+ Seattle courses</p>
+        </div>
       </div>
 
-      {/* Card */}
-      <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 w-full max-w-sm">
-        <h1 className="text-xl font-bold text-gray-900 mb-1">Welcome back</h1>
-        <p className="text-gray-500 text-sm mb-6">Sign in to check your tee times</p>
+      {/* Right panel — form */}
+      <div className="flex-1 flex flex-col items-center justify-center px-6 py-12">
+        {/* Mobile brand */}
+        <div className="lg:hidden text-center mb-8">
+          <a href="/" className="inline-flex items-center gap-2">
+            <span className="text-2xl">⛳</span>
+            <span className="text-2xl font-bold text-[#0f4c2a]">TeeDrop</span>
+          </a>
+        </div>
 
-        {registered && (
-          <div className="mb-5 p-3.5 bg-green-50 border border-green-200 rounded-xl text-green-700 text-sm font-medium">
-            Account created! Sign in to get started.
-          </div>
-        )}
-        {error && (
-          <div className="mb-5 p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-700 text-sm">
-            {error}
-          </div>
-        )}
+        <div className="w-full max-w-sm">
+          <h1 className="text-2xl font-bold text-gray-900 mb-1">Welcome back</h1>
+          <p className="text-gray-500 text-sm mb-7">Sign in to check your tee time alerts</p>
 
-        {/* SSO buttons */}
-        <div className="space-y-2.5 mb-5">
+          {registered && (
+            <div className="mb-5 p-3.5 bg-green-50 border border-green-200 rounded-xl text-green-700 text-sm font-medium">
+              Account created. Sign in to get started.
+            </div>
+          )}
+          {error && (
+            <div className="mb-5 p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-600 text-sm">
+              {error}
+            </div>
+          )}
+
+          {/* Google SSO */}
           <button
             onClick={() => handleOAuth('google')}
             disabled={!!oauthLoading}
-            className="w-full flex items-center justify-center gap-3 py-3 px-4 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-700 hover:bg-gray-50 active:scale-95 transition-all disabled:opacity-50"
+            className="w-full flex items-center justify-center gap-3 py-3 px-4 bg-white border border-gray-200 rounded-xl text-sm font-semibold text-gray-700 hover:bg-gray-50 hover:border-gray-300 active:scale-[0.99] transition-all disabled:opacity-50 shadow-sm mb-5"
           >
             <GoogleIcon />
             {oauthLoading === 'google' ? 'Redirecting...' : 'Continue with Google'}
           </button>
-        </div>
 
-        {/* Divider */}
-        <div className="flex items-center gap-3 mb-5">
-          <div className="flex-1 h-px bg-gray-100" />
-          <span className="text-xs text-gray-400 font-medium">or email</span>
-          <div className="flex-1 h-px bg-gray-100" />
-        </div>
+          {/* Divider */}
+          <div className="flex items-center gap-3 mb-5">
+            <div className="flex-1 h-px bg-gray-100" />
+            <span className="text-xs text-gray-400 font-medium">or</span>
+            <div className="flex-1 h-px bg-gray-100" />
+          </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-xs font-semibold text-gray-500 mb-1.5">Email</label>
-            <input
-              type="email"
-              className="w-full px-4 py-3.5 rounded-xl border border-gray-200 focus:border-primary focus:ring-2 focus:ring-primary/20 outline-none transition text-sm"
-              placeholder="you@example.com"
-              required
-              value={email}
-              onChange={e => setEmail(e.target.value)}
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-semibold text-gray-500 mb-1.5">Password</label>
-            <input
-              type="password"
-              className="w-full px-4 py-3.5 rounded-xl border border-gray-200 focus:border-primary focus:ring-2 focus:ring-primary/20 outline-none transition text-sm"
-              placeholder="••••••••"
-              required
-              value={password}
-              onChange={e => setPassword(e.target.value)}
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full py-3.5 bg-primary text-white font-bold rounded-xl shadow-sm active:scale-95 transition-transform disabled:opacity-50 text-sm"
-          >
-            {loading ? 'Signing in...' : 'Sign In'}
-          </button>
-        </form>
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label className="block text-xs font-semibold text-gray-500 mb-1.5 uppercase tracking-wide">Email</label>
+              <input
+                type="email"
+                className="w-full px-4 py-3.5 rounded-xl border border-gray-200 bg-white focus:border-[#0f4c2a] focus:ring-2 focus:ring-[#0f4c2a]/10 outline-none transition text-sm"
+                placeholder="you@example.com"
+                required
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-gray-500 mb-1.5 uppercase tracking-wide">Password</label>
+              <input
+                type="password"
+                className="w-full px-4 py-3.5 rounded-xl border border-gray-200 bg-white focus:border-[#0f4c2a] focus:ring-2 focus:ring-[#0f4c2a]/10 outline-none transition text-sm"
+                placeholder="••••••••"
+                required
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full py-3.5 bg-[#0f4c2a] text-white font-bold rounded-xl active:scale-[0.99] transition-transform disabled:opacity-50 text-sm shadow-sm hover:bg-[#0d3f23]"
+            >
+              {loading ? 'Signing in...' : 'Sign In'}
+            </button>
+          </form>
+
+          <p className="text-center mt-6 text-gray-500 text-sm">
+            Don&apos;t have an account?{' '}
+            <a href="/signup" className="text-[#0f4c2a] font-semibold hover:underline">Create one free</a>
+          </p>
+        </div>
       </div>
-
-      <p className="text-center mt-5 text-gray-500 text-sm">
-        Don&apos;t have an account?{' '}
-        <a href="/signup" className="text-primary font-semibold">Sign up free</a>
-      </p>
     </div>
   );
 }
@@ -136,7 +164,7 @@ function LoginForm() {
 export default function LoginPage() {
   return (
     <Suspense fallback={
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="min-h-screen flex items-center justify-center bg-[#fafaf8]">
         <div className="text-center">
           <div className="text-4xl animate-pulse mb-3">⛳</div>
           <p className="text-gray-400 text-sm">Loading...</p>

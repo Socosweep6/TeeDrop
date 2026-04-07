@@ -132,7 +132,7 @@ export default function AccountPage() {
       <div className="sticky top-0 z-40 px-5 py-3.5 bg-white border-b border-gray-100 flex items-center justify-between">
         <a href="/dashboard" className="text-sm text-gray-500 font-medium">← Back</a>
         <h1 className="text-base font-bold text-gray-900">Account</h1>
-        <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full capitalize font-medium">{user.tier}</span>
+        <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium">{user.tier === 'allaccess' ? 'All Access' : user.tier === 'premium' ? 'Premium' : 'Free'}</span>
       </div>
 
       {/* User summary */}

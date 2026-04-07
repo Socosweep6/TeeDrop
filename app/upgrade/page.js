@@ -172,7 +172,7 @@ export default function UpgradePage() {
           <div className="bg-white rounded-xl p-4 border border-gray-100">
             <p className="text-sm font-semibold text-gray-900 mb-1">When do alerts fire?</p>
             <p className="text-xs text-gray-500">
-              Chester (our scraper on a mini PC) checks courses throughout the day. When a new matching tee time appears, TeeDrop sends your alert instantly.
+              Our monitoring system checks courses throughout the day. When a new matching tee time appears, TeeDrop sends your alert instantly.
             </p>
           </div>
 

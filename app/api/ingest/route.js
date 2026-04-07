@@ -81,55 +81,47 @@ export async function POST(request) {
     let alertsSent = 0;
     if (newTeeTimes.length > 0) {
       try {
-        const usersWithAlerts = await prisma.user.findMany({
-          where: {
-            settings: {
-              OR: [{ alertEmail: true }, { alertSms: true }],
-            },
-          },
-          include: { settings: true },
-        });
+        const allNewIds = newTeeTimes.map(tt => tt.id).filter(Boolean);
+
+        // Batch queries: users + existing alerts in parallel (2 queries, not 2N)
+        const [usersWithAlerts, existingAlerts] = await Promise.all([
+          prisma.user.findMany({
+            where: { settings: { OR: [{ alertEmail: true }, { alertSms: true }] } },
+            include: { settings: true },
+          }),
+          allNewIds.length > 0
+            ? prisma.alert.findMany({
+                where: { teeTimeId: { in: allNewIds } },
+                select: { userId: true, teeTimeId: true, method: true },
+              })
+            : Promise.resolve([]),
+        ]);
+
+        // Build dedup set for O(1) lookups
+        const alreadySentSet = new Set(existingAlerts.map(a => `${a.userId}:${a.teeTimeId}:${a.method}`));
+        const alertsToCreate = [];
 
         for (const user of usersWithAlerts) {
           if (!user.settings) continue;
           if (isQuietHours(user.settings)) continue;
-
-          // Bug 6: skip non-instant frequency users
-          // hourly/daily users will get batched alerts via a separate cron job (TODO)
           const freq = user.settings.alertFrequency || 'instant';
           if (freq !== 'instant') continue;
 
-          const matching = newTeeTimes.filter(tt =>
-            matchesUserPreferences(tt, user.settings)
-          );
+          const matching = newTeeTimes.filter(tt => matchesUserPreferences(tt, user.settings));
           if (matching.length === 0) continue;
-
-          const teeTimeIds = matching.map(tt => tt.id);
 
           // Email alert
           if (user.settings.alertEmail) {
             const email = user.settings.alertEmailAddress || user.email;
             if (email) {
-              // Bug 3: dedup — skip tee times already alerted via email
-              const alreadySent = await prisma.alert.findMany({
-                where: { userId: user.id, teeTimeId: { in: teeTimeIds }, method: 'email' },
-                select: { teeTimeId: true },
-              });
-              const sentIds = new Set(alreadySent.map(a => a.teeTimeId));
-              const toAlert = matching.filter(tt => !sentIds.has(tt.id));
-
+              const toAlert = matching
+                .filter(tt => tt.id && !alreadySentSet.has(`${user.id}:${tt.id}:email`))
+                .slice(0, 10);
               if (toAlert.length > 0) {
-                const sent = await sendEmailAlert(email, toAlert.slice(0, 10));
-                if (sent) {
+                const ok = await sendEmailAlert(email, toAlert);
+                if (ok) {
                   alertsSent++;
-                  // Bug 2: save alert records
-                  await prisma.alert.createMany({
-                    data: toAlert.slice(0, 10).map(tt => ({
-                      userId: user.id,
-                      teeTimeId: tt.id,
-                      method: 'email',
-                    })),
-                  });
+                  toAlert.forEach(tt => alertsToCreate.push({ userId: user.id, teeTimeId: tt.id, method: 'email' }));
                 }
               }
             }
@@ -137,29 +129,22 @@ export async function POST(request) {
 
           // SMS alert (premium+ only)
           if (user.settings.alertSms && user.phone && user.tier !== 'free') {
-            // Bug 3: dedup — skip tee times already alerted via SMS
-            const alreadySent = await prisma.alert.findMany({
-              where: { userId: user.id, teeTimeId: { in: teeTimeIds }, method: 'sms' },
-              select: { teeTimeId: true },
-            });
-            const sentIds = new Set(alreadySent.map(a => a.teeTimeId));
-            const toAlert = matching.filter(tt => !sentIds.has(tt.id));
-
+            const toAlert = matching
+              .filter(tt => tt.id && !alreadySentSet.has(`${user.id}:${tt.id}:sms`))
+              .slice(0, 5);
             if (toAlert.length > 0) {
-              const sent = await sendSmsAlert(user.phone, toAlert.slice(0, 5));
-              if (sent) {
+              const ok = await sendSmsAlert(user.phone, toAlert);
+              if (ok) {
                 alertsSent++;
-                // Bug 2: save alert records
-                await prisma.alert.createMany({
-                  data: toAlert.slice(0, 5).map(tt => ({
-                    userId: user.id,
-                    teeTimeId: tt.id,
-                    method: 'sms',
-                  })),
-                });
+                toAlert.forEach(tt => alertsToCreate.push({ userId: user.id, teeTimeId: tt.id, method: 'sms' }));
               }
             }
           }
+        }
+
+        // Batch save all alert records in one query
+        if (alertsToCreate.length > 0) {
+          await prisma.alert.createMany({ data: alertsToCreate, skipDuplicates: true });
         }
       } catch (e) {
         console.error('Alert check error:', e.message);

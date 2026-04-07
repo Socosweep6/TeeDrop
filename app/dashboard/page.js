@@ -5,17 +5,23 @@ import { useSession, signOut } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import BottomNav from '../components/BottomNav';
 
+function formatTier(tier) {
+  if (tier === 'allaccess') return 'All Access';
+  if (tier === 'premium') return 'Premium';
+  return 'Free';
+}
+
 function SkeletonCard() {
   return (
     <div className="bg-white p-4 rounded-2xl border border-gray-100 animate-pulse">
       <div className="flex justify-between items-start mb-3">
         <div className="h-4 bg-gray-200 rounded w-2/3"></div>
-        <div className="h-4 bg-gray-200 rounded w-14"></div>
+        <div className="h-4 bg-gray-200 rounded w-10"></div>
       </div>
-      <div className="flex gap-3 mb-3">
-        <div className="h-3 bg-gray-100 rounded w-16"></div>
-        <div className="h-3 bg-gray-100 rounded w-12"></div>
-        <div className="h-3 bg-gray-100 rounded w-14"></div>
+      <div className="flex gap-2 flex-wrap mb-3">
+        <div className="h-7 bg-gray-100 rounded-xl w-20"></div>
+        <div className="h-7 bg-gray-100 rounded-xl w-20"></div>
+        <div className="h-7 bg-gray-100 rounded-xl w-20"></div>
       </div>
       <div className="h-10 bg-gray-100 rounded-xl"></div>
     </div>
@@ -60,7 +66,6 @@ export default function DashboardPage() {
     }
   }, [status, fetchTimes]);
 
-  // Bug 4 fix: removed hardcoded cron secret — refresh just re-fetches from DB
   async function handleRefresh() {
     setRefreshing(true);
     await fetchTimes();
@@ -79,7 +84,7 @@ export default function DashboardPage() {
 
   if (status === 'loading') {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="min-h-screen flex items-center justify-center bg-[#fafaf8]">
         <div className="text-center">
           <div className="text-4xl animate-pulse mb-3">⛳</div>
           <p className="text-gray-400 text-sm">Loading...</p>
@@ -88,33 +93,30 @@ export default function DashboardPage() {
     );
   }
 
-  // Group tee times by date
+  // Group tee times: by date, then by course within each date
   const grouped = {};
   for (const tt of teeTimes) {
-    const key = tt.rawDate || tt.date;
-    if (!grouped[key]) grouped[key] = { label: tt.date, times: [] };
-    grouped[key].times.push(tt);
+    const dateKey = tt.rawDate || tt.date;
+    if (!grouped[dateKey]) grouped[dateKey] = { label: tt.date, courses: {} };
+    const courseName = tt.course;
+    if (!grouped[dateKey].courses[courseName]) {
+      grouped[dateKey].courses[courseName] = { times: [], bookingUrl: tt.bookingUrl };
+    }
+    grouped[dateKey].courses[courseName].times.push(tt);
   }
 
   const nextTeeTime = teeTimes[0] || null;
-  const remainingTimes = teeTimes.slice(1);
-
-  // Grouped remaining times
-  const groupedRemaining = {};
-  for (const tt of remainingTimes) {
-    const key = tt.rawDate || tt.date;
-    if (!groupedRemaining[key]) groupedRemaining[key] = { label: tt.date, times: [] };
-    groupedRemaining[key].times.push(tt);
-  }
 
   return (
-    <div className="min-h-screen flex flex-col bg-gray-50">
+    <div className="min-h-screen flex flex-col bg-[#fafaf8]">
       {/* Header */}
       <div className="sticky top-0 z-40 px-5 py-3.5 bg-white border-b border-gray-100 flex justify-between items-center">
         <div className="flex items-center gap-2.5">
           <span className="text-xl">⛳</span>
           <span className="text-lg font-bold text-gray-900">TeeDrop</span>
-          <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full capitalize font-medium">{tier}</span>
+          <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-semibold">
+            {formatTier(tier)}
+          </span>
         </div>
         <button
           onClick={() => signOut({ callbackUrl: '/' })}
@@ -128,7 +130,7 @@ export default function DashboardPage() {
       <div className="flex-1 px-4 py-5 pb-24 max-w-lg mx-auto w-full">
         {loading ? (
           <div className="space-y-3">
-            <div className="h-36 bg-gray-200 rounded-2xl animate-pulse mb-5"></div>
+            <div className="h-40 bg-gray-200 rounded-2xl animate-pulse mb-5"></div>
             <SkeletonCard />
             <SkeletonCard />
             <SkeletonCard />
@@ -137,8 +139,8 @@ export default function DashboardPage() {
           <div className="text-center py-16">
             <div className="text-6xl mb-5">🏌️</div>
             <h2 className="text-xl font-bold text-gray-800 mb-2">No tee times found</h2>
-            <p className="text-gray-500 text-sm mb-6 max-w-xs mx-auto">
-              Chester's still scanning. Try adjusting your course selection or date preferences.
+            <p className="text-gray-500 text-sm mb-6 max-w-xs mx-auto leading-relaxed">
+              Adjust your course or date preferences, or check back after the next scan.
             </p>
             <div className="flex flex-col gap-3 items-center">
               <a
@@ -181,49 +183,59 @@ export default function DashboardPage() {
               </button>
             </div>
 
-            {/* Hero: next available tee time */}
+            {/* Hero: next available */}
             {nextTeeTime && (
-              <div className="bg-gradient-to-br from-primary to-green-700 text-white p-5 rounded-2xl shadow-md">
-                <p className="text-xs font-semibold text-green-200 uppercase tracking-wider mb-2">Next Available</p>
-                <h3 className="text-lg font-bold leading-tight">{nextTeeTime.course}</h3>
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-sm text-green-100">
-                  <span>{nextTeeTime.date}</span>
-                  <span className="text-green-300">·</span>
-                  <span>{nextTeeTime.time}</span>
-                  <span className="text-green-300">·</span>
-                  <span>{nextTeeTime.players}p</span>
-                  <span className="text-green-300">·</span>
-                  <span>{nextTeeTime.holes}h</span>
-                </div>
-                <div className="flex items-center justify-between mt-4">
-                  <span className="text-2xl font-bold">{nextTeeTime.price}</span>
-                  {nextTeeTime.bookingUrl ? (
-                    <a
-                      href={nextTeeTime.bookingUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="px-5 py-2.5 bg-white text-primary font-bold rounded-xl text-sm active:scale-95 transition-transform shadow-sm"
-                    >
-                      Book Now →
-                    </a>
-                  ) : (
-                    <span className="px-5 py-2.5 bg-white/20 text-white/70 font-medium rounded-xl text-sm">
-                      No link
+              <div className="bg-[#0f4c2a] text-white p-5 rounded-2xl shadow-md relative overflow-hidden">
+                <div
+                  className="absolute inset-0 opacity-[0.04]"
+                  style={{ backgroundImage: 'radial-gradient(circle at 1px 1px, white 1px, transparent 0)', backgroundSize: '20px 20px' }}
+                />
+                <div className="relative z-10">
+                  <p className="text-xs font-bold text-green-300 uppercase tracking-wider mb-2">Next Available</p>
+                  <h3 className="text-lg font-bold leading-tight">{nextTeeTime.course}</h3>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-sm text-white/75">
+                    <span>{nextTeeTime.date}</span>
+                    <span className="text-white/30">·</span>
+                    <span>{nextTeeTime.time}</span>
+                    <span className="text-white/30">·</span>
+                    <span>{nextTeeTime.players}p</span>
+                    {nextTeeTime.holes && (
+                      <><span className="text-white/30">·</span><span>{nextTeeTime.holes}h</span></>
+                    )}
+                  </div>
+                  <div className="flex items-center justify-between mt-4">
+                    <span className="text-xl font-bold">
+                      {nextTeeTime.price && nextTeeTime.price !== 'N/A' ? nextTeeTime.price : ''}
                     </span>
-                  )}
+                    {nextTeeTime.bookingUrl && (
+                      <a
+                        href={nextTeeTime.bookingUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-5 py-2.5 bg-white text-[#0f4c2a] font-bold rounded-xl text-sm active:scale-95 transition-transform shadow-sm"
+                      >
+                        Book Now →
+                      </a>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
 
-            {/* Remaining tee times grouped by date */}
-            {Object.entries(groupedRemaining).map(([dateKey, group]) => (
+            {/* Tee times grouped by date → course */}
+            {Object.entries(grouped).map(([dateKey, dateGroup]) => (
               <div key={dateKey}>
                 <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2.5 px-1">
-                  {group.label}
+                  {dateGroup.label}
                 </h3>
-                <div className="space-y-2">
-                  {group.times.map((tt) => (
-                    <TeeTimeCard key={tt.id} tt={tt} />
+                <div className="space-y-2.5">
+                  {Object.entries(dateGroup.courses).map(([courseName, courseData]) => (
+                    <CourseCard
+                      key={courseName}
+                      courseName={courseName}
+                      times={courseData.times}
+                      bookingUrl={courseData.bookingUrl}
+                    />
                   ))}
                 </div>
               </div>
@@ -237,29 +249,52 @@ export default function DashboardPage() {
   );
 }
 
-function TeeTimeCard({ tt }) {
+function CourseCard({ courseName, times, bookingUrl }) {
+  const [expanded, setExpanded] = useState(false);
+  const visible = expanded ? times : times.slice(0, 6);
+  const hasMore = times.length > 6;
+  const shortName = courseName.replace(/ Golf Course| Golf Club| Golf Complex| Golf Links/g, '').trim();
+
   return (
-    <div className="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 active:scale-[0.99] transition-transform">
-      <div className="flex justify-between items-start mb-2">
-        <div className="flex-1 min-w-0 pr-3">
-          <h4 className="font-semibold text-gray-900 text-sm leading-tight truncate">{tt.course}</h4>
-          <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1.5 text-xs text-gray-500">
-            <span>⏰ {tt.time}</span>
-            <span>👥 {tt.players}p</span>
-            <span>⛳ {tt.holes}h</span>
-          </div>
-        </div>
-        <span className="text-primary font-bold text-sm flex-shrink-0">{tt.price}</span>
+    <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden shadow-sm">
+      <div className="px-4 pt-4 pb-3 flex justify-between items-center">
+        <h4 className="font-bold text-gray-900 text-sm leading-tight flex-1 pr-3">{courseName}</h4>
+        <span className="text-xs text-gray-400 flex-shrink-0 bg-gray-50 px-2 py-1 rounded-lg">
+          {times.length} {times.length === 1 ? 'time' : 'times'}
+        </span>
       </div>
-      {tt.bookingUrl && (
-        <a
-          href={tt.bookingUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="mt-3 block w-full py-2.5 bg-primary text-white text-sm font-semibold rounded-xl text-center active:scale-95 transition-transform"
-        >
-          Book Now →
-        </a>
+
+      <div className="px-4 pb-3 flex flex-wrap gap-1.5">
+        {visible.map((tt, i) => (
+          <span
+            key={i}
+            className="inline-flex items-center gap-1 px-3 py-1.5 bg-gray-50 border border-gray-100 rounded-xl text-xs font-semibold text-gray-700"
+          >
+            {tt.time}
+            {tt.players && <span className="text-gray-400 font-normal">· {tt.players}p</span>}
+          </span>
+        ))}
+        {hasMore && !expanded && (
+          <button
+            onClick={() => setExpanded(true)}
+            className="px-3 py-1.5 bg-primary/5 border border-primary/20 rounded-xl text-xs font-semibold text-primary"
+          >
+            +{times.length - 6} more
+          </button>
+        )}
+      </div>
+
+      {bookingUrl && (
+        <div className="px-3 pb-3">
+          <a
+            href={bookingUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="block w-full py-2.5 bg-primary text-white text-sm font-bold rounded-xl text-center active:scale-[0.99] transition-transform"
+          >
+            Book at {shortName} →
+          </a>
+        </div>
       )}
     </div>
   );
