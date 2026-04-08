@@ -556,6 +556,7 @@ async function scrapeCPS(course, dates) {
     process.stdout.write(`  [CPS] No courseId for ${course.cpsSlug} — skipping\n`);
     return [];
   }
+  process.stdout.write(`  [CPS] courseId=${courseId} for ${course.cpsSlug}\n`);
 
   const holeCount = course.holes === 9 ? 9 : 18;
   const results = [];
