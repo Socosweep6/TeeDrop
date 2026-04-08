@@ -464,8 +464,8 @@ async function fetchCpsAllOptions() {
       const result = await cpsPage.evaluate(
         async ({ url, userToken, componentId }) => {
           const hdrs = { 'Accept': 'application/json', 'Authorization': `Bearer ${userToken}` };
-          if (componentId) hdrs['componentid'] = componentId;
-          const r = await fetch(url, { headers: hdrs }).catch(e => ({ ok: false, status: 0, text: () => e.message }));
+          if (componentId) hdrs['x-componentid'] = componentId;
+          const r = await fetch(url, { headers: hdrs }).catch(e => ({ ok: false, status: 0, statusText: e.message, text: () => e.message }));
           const t = typeof r.text === 'function' ? await r.text() : (r.statusText || '');
           return { status: r.status, text: t };
         },
@@ -479,7 +479,11 @@ async function fetchCpsAllOptions() {
       console.log(`  [CPS] GetAllOptions HTTP ${result.status} — ${result.text.slice(0, 100)}`);
     } else {
       const res = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${cpsToken}`,
+          'Accept': 'application/json',
+          'x-componentid': cpsComponentId || '1',
+        },
         signal: AbortSignal.timeout(15000),
       });
       if (res.ok) {
