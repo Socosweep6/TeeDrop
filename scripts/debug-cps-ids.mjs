@@ -45,7 +45,7 @@ console.log('Token OK\n');
 const optRes = await fetch(
   'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3',
   {
-    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json', 'componentid': '1' },
     signal: AbortSignal.timeout(15000),
   }
 );
@@ -84,7 +84,7 @@ console.log('\nTrying GetAvailableTimeSheet with various courseIds...');
 for (const id of [2, 3, 4, 6, 100, 101, 102, 125, 200, 201]) {
   const url = `https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAvailableTimeSheet/premiergolf?courseId=${id}&bookingDate=04%2F09%2F2026&holeCount=18&players=1&numberOfGuests=0&product=3`;
   const r = await fetch(url, {
-    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json', 'componentid': '1' },
     signal: AbortSignal.timeout(8000),
   });
   const body = await r.text();
