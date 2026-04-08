@@ -19,11 +19,23 @@
 
 import { COURSES } from '../lib/courses.js';
 
+// Load .env.local if present (Chester doesn't run through Next.js)
+try {
+  const { readFileSync } = await import('fs');
+  const env = readFileSync(new URL('../.env.local', import.meta.url), 'utf8');
+  for (const line of env.split('\n')) {
+    const m = line.match(/^([^#=]+)=(.*)$/);
+    if (m) process.env[m[1].trim()] ??= m[2].trim();
+  }
+} catch { /* no .env.local — use shell env */ }
+
 const INGEST_URL = process.env.INGEST_URL || 'https://web-xi-one-0b1g412w29.vercel.app/api/ingest';
 const INGEST_SECRET = process.env.INGEST_SECRET || 'teedrop-ingest-2026';
 const DAYS_AHEAD = 14;
 const CONCURRENCY = 3;
 const HEADLESS = process.env.HEADLESS !== 'false';
+const CPS_EMAIL    = process.env.CPS_EMAIL    || null;
+const CPS_PASSWORD = process.env.CPS_PASSWORD || null;
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -156,27 +168,72 @@ async function scrapeChronogolfDate(course, date, cookie) {
 
 async function scrapeChronogolf(course, dates) {
   process.stdout.write(`\n[${course.name}] Chronogolf${course.affiliationTypeId ? '' : ' (no affiliation ID — trying without)'}\n`);
-  const cookie = await getChronogolfCookie(course.chronogolfSlug);
 
   const teeTimes = [];
+  let cookie = await getChronogolfCookie(course.chronogolfSlug);
+  let consecutiveErrors = 0;
+
   for (const date of dates) {
+    // Re-fetch cookie every 5 dates to avoid Cloudflare session expiry
+    if (teeTimes.length > 0 && dates.indexOf(date) % 5 === 0) {
+      cookie = await getChronogolfCookie(course.chronogolfSlug);
+      await delay(1500);
+    }
+
     const results = await scrapeChronogolfDate(course, date, cookie);
-    teeTimes.push(...results);
-    if (results.length > 0) await ingest(results);
-    await delay(350);
+
+    if (results.length === 0) {
+      consecutiveErrors++;
+      // Back off if we're getting blocked
+      if (consecutiveErrors >= 3) {
+        await delay(3000);
+        consecutiveErrors = 0;
+      } else {
+        await delay(1200);
+      }
+    } else {
+      consecutiveErrors = 0;
+      await ingest(results);
+      teeTimes.push(...results);
+      await delay(1200);
+    }
   }
   return teeTimes;
 }
 
 // ── GolfNow ───────────────────────────────────────────────────────────────────
 
+const GN_MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function toGolfNowDate(isoDate) {
+  // "2026-04-12" → "Apr 12 2026" — manual to avoid timezone shift from new Date(isoStr)
+  const [year, mon, day] = isoDate.split('-').map(Number);
+  return `${GN_MONTHS[mon - 1]} ${day} ${year}`;
+}
+
+async function getGolfNowCookies(facilityId) {
+  try {
+    const res = await fetch(`https://www.golfnow.com/tee-times/facility/${facilityId}/search`, {
+      headers: { 'User-Agent': UA, 'Accept': 'text/html', 'Connection': 'keep-alive' },
+      signal: AbortSignal.timeout(10000),
+    });
+    const raw = res.headers.get('set-cookie') || '';
+    return raw.split(/,(?=[^ ])/).map(c => c.split(';')[0].trim()).filter(Boolean).join('; ');
+  } catch {
+    return '';
+  }
+}
+
 async function scrapeGolfNow(course, dates) {
   process.stdout.write(`\n[${course.name}] GolfNow (ID: ${course.golfnowId})\n`);
+
+  const cookie = await getGolfNowCookies(course.golfnowId);
   const teeTimes = [];
 
   for (const date of dates) {
     try {
-      const res = await fetch('https://www.golfnow.com/api/tee-times/tee-time-results', {
+      const gnDate = toGolfNowDate(date);
+      const res = await fetch('https://www.golfnow.com/api/tee-times/tee-time-search-results', {
         method: 'POST',
         headers: {
           'User-Agent': UA,
@@ -184,52 +241,92 @@ async function scrapeGolfNow(course, dates) {
           'Content-Type': 'application/json',
           'Referer': `https://www.golfnow.com/tee-times/facility/${course.golfnowId}/search`,
           'Origin': 'https://www.golfnow.com',
+          'Cookie': cookie,
         },
         body: JSON.stringify({
-          FacilityId: parseInt(course.golfnowId),
-          Date: date,
-          Players: 1,    // 1 = show all slots regardless of group size
-          Holes: 0,      // 0 = any
-          PriceMin: 0,
-          PriceMax: 10000,
-          SortBy: 'Date',
-          SortByRollup: 'Date',
-          View: 'Grouping',
-          ExcludeFeaturedDeals: false,
+          useWidgetNextAvailableDays: null,
+          nextAvailableTeeTime: null,
+          tags: null,
+          address: null,
+          pageSize: 50,
+          teeTimeCount: 50,
+          pageNumber: 0,
+          date: gnDate,
+          sortBy: 'Date',
+          sortByRollup: 'Date.MinDate',
+          sortDirection: 0,
+          hotDealsOnly: false,
+          golfPassPerksOnly: false,
+          bestDealsOnly: false,
+          promotedCampaignsOnly: false,
+          priceMin: 0,
+          priceMax: 10000,
+          players: 1,
+          timePeriod: 'Any',
+          timeMin: 0,
+          timeMax: 47,
+          holes: '18',
+          facilityType: 'GolfCourse',
+          latitude: null,
+          longitude: null,
+          radius: 35,
+          maxAllowedRadius: null,
+          facilityId: parseInt(course.golfnowId),
+          facilityIds: [],
+          marketId: null,
+          marketName: null,
+          searchType: 'Facility',
+          view: 'Grouping',
+          nonGPS: null,
+          excludeFeaturedFacilities: true,
+          excludePrivateFacilities: false,
+          rateTagCodes: null,
+          customerToken: null,
+          rateType: 'all',
+          currentClientDate: new Date().toISOString(),
+          daysToSearch: null,
+          facilityTagsExclusive: null,
+          isSimulator: null,
+          isHotDealsZoneMoreDeals: null,
+          facilityGroupId: null,
+          trackmanOnly: false,
         }),
         signal: AbortSignal.timeout(12000),
       });
 
       if (!res.ok) {
         process.stdout.write(`  ${date}: HTTP ${res.status}\n`);
-        await delay(300);
+        await delay(500);
         continue;
       }
 
       const data = await res.json();
-      // GolfNow API response structure varies — try all known paths
-      const list = data?.ttResults?.teeTimes
-        || data?.TeeTimeResults
-        || data?.teeTimeResults
-        || data?.results
-        || data?.Results
-        || [];
+      const list = data?.ttResults?.teeTimes || data?.results || [];
 
       const batch = list
         .map(tt => {
-          const rates = tt.Rates || tt.rates || [];
-          const price = rates[0]?.DisplayRate || tt.DisplayRate || tt.Price || tt.price || '';
-          const timeStr = tt.Time || tt.time || tt.StartTime || tt.startTime || '';
+          // Time is an object: { formatted: '6:22', formattedTimeMeridian: 'AM', date: ISO }
+          const timeObj = tt.time;
+          const timeStr = timeObj?.formatted
+            ? `${timeObj.formatted} ${timeObj.formattedTimeMeridian}`
+            : (timeObj?.date || tt.Time || tt.startTime || '');
+
+          // Price: displayRate object has formattedValue2 like "$36.00"
+          const priceVal = tt.displayRate?.formattedValue2
+            || tt.minTeeTimeRate?.formattedValue2
+            || tt.teeTimeRates?.[0]?.singlePlayerPrice?.greensFees?.formattedValue2
+            || '';
+
           return {
             course: course.name,
             date,
             time: formatTime(timeStr),
-            players: tt.PlayerRule?.MaxPlayers || tt.MaxPlayers || tt.maxPlayers || 4,
-            price: typeof price === 'number'
-              ? `$${price.toFixed(2)}`
-              : (String(price).startsWith('$') ? String(price) : price ? `$${price}` : 'N/A'),
-            holes: tt.Holes || tt.holes || course.holes || 18,
-            bookingUrl: `${course.bookingUrl}#date=${date}`,
+            players: 4, // GolfNow playerRule is "Any" — always default 4
+            price: priceVal || 'N/A',
+            holes: tt.teeTimeRates?.[0]?.holeCount || course.holes || 18,
+            bookingUrl: tt.detailUrl
+              ? `https://www.golfnow.com${tt.detailUrl}`
+              : `${course.bookingUrl}#date=${date}`,
             source: 'golfnow',
           };
         })
@@ -243,147 +340,299 @@ async function scrapeGolfNow(course, dates) {
     } catch (err) {
       process.stdout.write(`  ${date}: error — ${err.message}\n`);
     }
-    await delay(300);
+    await delay(400);
   }
   return teeTimes;
 }
 
-// ── CPS (Premier Golf) — Playwright ──────────────────────────────────────────
+// ── CPS (Premier Golf) — OAuth + API via Playwright browser ──────────────────
+//
+// Auth: grant_type=password OAuth to get a bearer token.
+// Course IDs: GetAllOptions API, intercepted from Angular's own requests.
+// Tee times: GetAvailableTimeSheet API, called in-browser to inherit cookies.
+//
+// Requires CPS_EMAIL and CPS_PASSWORD env vars. Skips cleanly if missing.
+// client_id/client_secret are public constants baked into the Angular app.
 
-let playwrightAvailable = null;
+let cpsToken = null;
+let cpsCourseIdMap = {};
+let cpsComponentId = null;
+let cpsAngularHeaders = null;
+let cpsPage = null;
+let cpsInitialized = false;
 
-async function checkPlaywright() {
-  if (playwrightAvailable !== null) return playwrightAvailable;
-  try {
-    await import('playwright');
-    playwrightAvailable = true;
-  } catch {
-    playwrightAvailable = false;
-    console.log('\n⚠️  Playwright not installed. CPS courses will be skipped.');
-    console.log('   To enable: npm install playwright && npx playwright install chromium\n');
+async function initCps(browser) {
+  if (cpsInitialized) return;
+
+  if (!CPS_EMAIL || !CPS_PASSWORD) {
+    console.log('  [CPS] Skipping — CPS_EMAIL / CPS_PASSWORD not set');
+    cpsInitialized = true;
+    return;
   }
-  return playwrightAvailable;
-}
 
-async function scrapeCPSDate(page, course, date) {
-  const url = `https://premiergolf.cps.golf/reserve/${course.cpsSlug}?date=${date}`;
+  // Step 1: OAuth token
+  console.log(`  [CPS] OAuth login as ${CPS_EMAIL}...`);
   try {
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 20000 });
-
-    // Wait for tee time content — CPS renders a React app
-    // Try multiple possible selectors for robustness
-    const loaded = await Promise.race([
-      page.waitForSelector('[class*="tee-time"], [class*="teetime"], .time-slot, [data-testid*="tee"]', { timeout: 8000 }).then(() => true),
-      page.waitForSelector('table tr td', { timeout: 8000 }).then(() => true),
-      page.waitForSelector('[class*="reservation"], [class*="booking"]', { timeout: 8000 }).then(() => true),
-      new Promise(r => setTimeout(() => r(false), 9000)),
-    ]);
-
-    if (!loaded) {
-      process.stdout.write(`  ${date}: no tee time elements found\n`);
-      return [];
-    }
-
-    const times = await page.evaluate((courseName, dateStr) => {
-      const results = [];
-
-      // Strategy 1: look for tee-time specific elements
-      const teeSelectors = [
-        '[class*="tee-time"]',
-        '[class*="teetime"]',
-        '[class*="TeeTime"]',
-        '.time-slot',
-        '.tee-slot',
-        '[data-testid*="tee"]',
-      ];
-
-      for (const sel of teeSelectors) {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) {
-          els.forEach(el => {
-            const timeEl = el.querySelector('[class*="time"], time, [class*="hour"]');
-            const priceEl = el.querySelector('[class*="price"], [class*="rate"], [class*="fee"], [class*="cost"]');
-            const playerEl = el.querySelector('[class*="player"], [class*="spot"], [class*="avail"]');
-
-            const timeText = timeEl?.textContent?.trim()
-              || el.getAttribute('data-time')
-              || el.getAttribute('data-start');
-
-            if (timeText && /\d+:\d+/.test(timeText)) {
-              results.push({
-                time: timeText,
-                price: priceEl?.textContent?.trim()?.replace(/[^\d.$]/g, '') || 'N/A',
-                players: parseInt(playerEl?.textContent?.match(/\d+/)?.[0] || '4') || 4,
-              });
-            }
-          });
-          if (results.length > 0) return results;
-        }
+    const tokenRes = await fetch(
+      'https://premiergolf.cps.golf/identityapi/connect/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'password',
+          username: CPS_EMAIL,
+          password: CPS_PASSWORD,
+          client_id: 'js1',
+          client_secret: 'v4secret',
+          scope: 'onlinereservation references',
+        }),
+        signal: AbortSignal.timeout(15000),
       }
+    );
+    const tokenJson = await tokenRes.json();
+    if (!tokenJson.access_token) {
+      throw new Error(`Token error: ${JSON.stringify(tokenJson)}`);
+    }
+    cpsToken = tokenJson.access_token;
+    try {
+      const payload = JSON.parse(Buffer.from(cpsToken.split('.')[1], 'base64url').toString());
+      cpsComponentId = payload.component_id ? String(payload.component_id) : null;
+      console.log(`  [CPS] Token OK. component_id=${cpsComponentId}`);
+    } catch {
+      console.log('  [CPS] Token OK (could not decode JWT)');
+    }
+  } catch (err) {
+    console.error(`  [CPS] OAuth failed: ${err.message}`);
+    cpsInitialized = true;
+    return;
+  }
 
-      // Strategy 2: look in tables (common for booking sites)
-      const rows = document.querySelectorAll('table tr');
-      rows.forEach(row => {
-        const cells = row.querySelectorAll('td');
-        if (cells.length >= 2) {
-          const firstCell = cells[0]?.textContent?.trim();
-          if (firstCell && /\d+:\d+\s*(AM|PM)/i.test(firstCell)) {
-            results.push({
-              time: firstCell,
-              price: cells[2]?.textContent?.trim() || cells[1]?.textContent?.trim() || 'N/A',
-              players: 4,
-            });
+  // Step 2: Browser session — intercept Angular's own GetAllOptions call to
+  // capture the real componentid header and build the course ID map.
+  try {
+    const context = await browser.newContext({
+      userAgent: UA,
+      viewport: { width: 1280, height: 900 },
+    });
+    cpsPage = await context.newPage();
+
+    const headersReady = new Promise((resolve) => {
+      cpsPage.on('request', req => {
+        if (req.url().includes('GetAllOptions')) {
+          const headers = req.headers();
+          cpsAngularHeaders = headers;
+          const cidKey = Object.keys(headers).find(k => k.toLowerCase().includes('componentid'));
+          if (cidKey) {
+            cpsComponentId = headers[cidKey];
+            console.log(`  [CPS] componentid captured: ${cpsComponentId}`);
           }
+          resolve(headers);
         }
       });
+      cpsPage.on('response', async resp => {
+        if (resp.url().includes('GetAllOptions') && resp.status() === 200) {
+          try { buildCpsCourseMap(await resp.json()); } catch {}
+        }
+      });
+    });
 
-      return results;
-    }, course.name, date);
-
-    process.stdout.write(`  ${date}: ${times.length} times\n`);
-
-    return times.map(t => ({
-      course: course.name,
-      date,
-      time: t.time,
-      players: t.players || 4,
-      price: t.price?.startsWith('$') ? t.price : (t.price && t.price !== 'N/A' ? `$${t.price}` : 'N/A'),
-      holes: course.holes || 18,
-      bookingUrl: `${course.bookingUrl}?date=${date}`,
-      source: 'cps',
-    }));
+    await cpsPage.goto(
+      'https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
+      { waitUntil: 'networkidle', timeout: 30000 }
+    );
+    await Promise.race([headersReady, delay(5000)]);
+    console.log(`  [CPS] Browser at: ${cpsPage.url().slice(0, 80)}`);
   } catch (err) {
-    process.stdout.write(`  ${date}: error — ${err.message}\n`);
-    return [];
+    console.error(`  [CPS] Browser setup error: ${err.message}`);
+    cpsPage = null;
   }
+
+  // Step 3: If Angular didn't fire GetAllOptions, try a direct call
+  if (Object.keys(cpsCourseIdMap).length === 0) {
+    console.log('  [CPS] No courses from Angular — trying direct GetAllOptions');
+    await fetchCpsAllOptions();
+  }
+
+  cpsInitialized = true;
+  console.log(`  [CPS] Ready. Token: ${cpsToken ? 'YES' : 'NO'} | Courses: ${Object.keys(cpsCourseIdMap).length} | Browser: ${cpsPage ? 'YES' : 'NO'}`);
+}
+
+async function fetchCpsAllOptions() {
+  const url = 'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3';
+  try {
+    if (cpsPage) {
+      const result = await cpsPage.evaluate(
+        async ({ url, userToken, componentId }) => {
+          const hdrs = { 'Accept': 'application/json', 'Authorization': `Bearer ${userToken}` };
+          if (componentId) hdrs['componentid'] = componentId;
+          const r = await fetch(url, { headers: hdrs }).catch(e => ({ ok: false, status: 0, text: () => e.message }));
+          const t = typeof r.text === 'function' ? await r.text() : (r.statusText || '');
+          return { status: r.status, text: t };
+        },
+        { url, userToken: cpsToken, componentId: cpsComponentId }
+      );
+      if (result.status === 200) {
+        buildCpsCourseMap(JSON.parse(result.text));
+        console.log(`  [CPS] GetAllOptions OK (in-browser): ${Object.keys(cpsCourseIdMap).length} courses`);
+        return;
+      }
+      console.log(`  [CPS] GetAllOptions HTTP ${result.status} — ${result.text.slice(0, 100)}`);
+    } else {
+      const res = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${cpsToken}`, 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        buildCpsCourseMap(await res.json());
+        console.log(`  [CPS] GetAllOptions OK (direct): ${Object.keys(cpsCourseIdMap).length} courses`);
+      } else {
+        console.log(`  [CPS] GetAllOptions HTTP ${res.status} (direct)`);
+      }
+    }
+  } catch (err) {
+    console.warn(`  [CPS] GetAllOptions error: ${err.message}`);
+  }
+}
+
+function buildCpsCourseMap(options) {
+  const walk = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    if (Array.isArray(obj)) { obj.forEach(walk); return; }
+    if (obj.courseId != null && (obj.name || obj.courseName || obj.siteName)) {
+      const rawName = (obj.name || obj.courseName || obj.siteName || '').toLowerCase().trim();
+      cpsCourseIdMap[`__name:${rawName}`] = obj.courseId;
+    }
+    Object.values(obj).forEach(walk);
+  };
+  walk(options);
+}
+
+function getCpsCourseId(cpsSlug) {
+  const tokens = cpsSlug
+    .replace(/-golf-course$|-golf-center$|-golf$/, '')
+    .split('-')
+    .filter(t => t.length > 2);
+  for (const [key, id] of Object.entries(cpsCourseIdMap)) {
+    const name = key.replace('__name:', '');
+    if (tokens.every(t => name.includes(t))) return id;
+    if (tokens[0] && name.startsWith(tokens[0])) return id;
+  }
+  return null;
+}
+
+function extractCpsTeeTimesFromJson(json) {
+  const candidates = [
+    json.tee_times, json.teeTimes, json.times, json.data,
+    json.availableTimes, json.available_times, json.slots,
+    json.timeSheet, json.TimeSheet, json.teeSheet, json.TeeSheet,
+    Array.isArray(json) ? json : null,
+  ].filter(Boolean);
+
+  for (const arr of candidates) {
+    if (!Array.isArray(arr) || arr.length === 0) continue;
+    const first = arr[0];
+    const timeField = ['time', 'start_time', 'teeTime', 'TeeTime', 'startTime', 'StartTime', 'teeTimeFrom']
+      .find(f => first[f] != null);
+    if (!timeField) continue;
+    return arr.map(slot => ({
+      time: formatTime(slot[timeField]),
+      players: slot.available_spots ?? slot.availableSpots ?? slot.maxPlayers ?? slot.MaxPlayers ?? 4,
+      price: slot.price != null
+        ? (typeof slot.price === 'string' ? slot.price : `$${(slot.price / 100).toFixed(2)}`)
+        : null,
+      holes: slot.holes ?? slot.nb_holes ?? slot.HoleCount ?? 18,
+    }));
+  }
+  return [];
 }
 
 async function scrapeCPS(course, dates) {
-  if (!course.cpsSlug) return [];
-  if (!await checkPlaywright()) return [];
-
-  process.stdout.write(`\n[${course.name}] CPS/Playwright\n`);
-
-  const { chromium } = await import('playwright');
-  const browser = await chromium.launch({ headless: HEADLESS });
-  const context = await browser.newContext({ userAgent: UA, viewport: { width: 1280, height: 800 } });
-  const page = await context.newPage();
-
-  // Block images/fonts/media for speed
-  await page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,mp4,webm}', r => r.abort());
-
-  const teeTimes = [];
-  try {
-    for (const date of dates) {
-      const results = await scrapeCPSDate(page, course, date);
-      teeTimes.push(...results);
-      if (results.length > 0) await ingest(results);
-      await delay(600);
-    }
-  } finally {
-    await browser.close();
+  if (!cpsToken) {
+    process.stdout.write(`  [CPS] No token — skipping\n`);
+    return [];
   }
-  return teeTimes;
+  const courseId = getCpsCourseId(course.cpsSlug);
+  if (!courseId) {
+    process.stdout.write(`  [CPS] No courseId for ${course.cpsSlug} — skipping\n`);
+    return [];
+  }
+
+  const holeCount = course.holes === 9 ? 9 : 18;
+  const results = [];
+
+  for (const date of dates) {
+    const [y, m, d] = date.split('-');
+    const bookingDate = `${m}/${d}/${y}`;
+    const base = 'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation';
+    const qs = `courseId=${courseId}&bookingDate=${encodeURIComponent(bookingDate)}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
+    const url = `${base}/GetAvailableTimeSheet/premiergolf?${qs}&product=3`;
+
+    try {
+      let status, text;
+
+      if (cpsPage) {
+        const result = await cpsPage.evaluate(
+          async ({ url, token, angularHeaders }) => {
+            try {
+              const hdrs = angularHeaders ? { ...angularHeaders } : {};
+              hdrs['authorization'] = `Bearer ${token}`;
+              hdrs['accept'] = 'application/json';
+              const res = await fetch(url, { headers: hdrs });
+              return { status: res.status, text: await res.text() };
+            } catch (e) {
+              return { status: 0, text: e.message };
+            }
+          },
+          { url, token: cpsToken, angularHeaders: cpsAngularHeaders }
+        );
+        status = result.status;
+        text = result.text;
+      } else {
+        const res = await fetch(url, {
+          headers: {
+            'Authorization': `Bearer ${cpsToken}`,
+            'x-componentid': cpsComponentId || '1',
+            'Accept': 'application/json',
+          },
+          signal: AbortSignal.timeout(10000),
+        });
+        status = res.status;
+        text = await res.text();
+      }
+
+      if (status === 401) {
+        process.stdout.write(`  [CPS] 401 — token expired\n`);
+        cpsToken = null;
+        break;
+      }
+      if (status !== 200) {
+        process.stdout.write(`  ${date}: HTTP ${status} — ${text.slice(0, 80)}\n`);
+        continue;
+      }
+
+      const times = extractCpsTeeTimesFromJson(JSON.parse(text));
+      const batch = times.map(t => ({
+        course: course.name,
+        date,
+        time: t.time,
+        players: t.players,
+        price: t.price || 'N/A',
+        holes: t.holes || course.holes || 18,
+        bookingUrl: `${course.bookingUrl}?date=${date}`,
+        source: 'cps',
+      })).filter(t => t.time);
+
+      process.stdout.write(`  ${date}: ${batch.length} times\n`);
+      if (batch.length > 0) {
+        await ingest(batch);
+        results.push(...batch);
+      }
+    } catch (err) {
+      process.stdout.write(`  ${date}: error — ${err.message.split('\n')[0]}\n`);
+    }
+    await delay(500);
+  }
+  return results;
 }
 
 // ── Routing ───────────────────────────────────────────────────────────────────
@@ -408,6 +657,7 @@ async function main() {
 
   console.log(`TeeDrop scraper — ${dates.length} days ahead`);
   console.log(`Courses: ${chronogolfCourses.length} Chronogolf, ${golfnowCourses.length} GolfNow, ${cpsCourses.length} CPS`);
+  console.log(`CPS credentials: ${CPS_EMAIL ? 'SET' : 'NOT SET'}`);
   console.log(`Ingest: ${INGEST_URL}\n`);
 
   let total = 0;
@@ -425,11 +675,37 @@ async function main() {
     await delay(2000);
   }
 
-  // CPS — sequential with Playwright (browser startup overhead)
-  for (const course of cpsCourses) {
-    const found = await processCourse(course, dates);
-    total += found.length;
-    await delay(1000);
+  // CPS — init browser once, share across all courses
+  let cpsBrowser = null;
+  if (cpsCourses.length > 0) {
+    if (!CPS_EMAIL || !CPS_PASSWORD) {
+      console.log('[CPS] Skipping all CPS courses — CPS_EMAIL / CPS_PASSWORD not set\n');
+    } else {
+      try {
+        const { chromium } = await import('playwright');
+        cpsBrowser = await chromium.launch({
+          headless: HEADLESS,
+          args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        });
+        console.log('Initializing CPS...');
+        await initCps(cpsBrowser);
+        console.log('');
+      } catch (err) {
+        console.log(`[CPS] Playwright not available — skipping CPS courses: ${err.message}\n`);
+      }
+    }
+  }
+
+  try {
+    for (const course of cpsCourses) {
+      process.stdout.write(`\n[${course.name}] CPS/API\n`);
+      const found = await scrapeCPS(course, dates);
+      total += found.length;
+      await delay(500);
+    }
+  } finally {
+    if (cpsPage) await cpsPage.context().close().catch(() => {});
+    if (cpsBrowser) await cpsBrowser.close().catch(() => {});
   }
 
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
