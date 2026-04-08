@@ -41,16 +41,29 @@ if (!tokenJson.access_token) {
 const token = tokenJson.access_token;
 console.log('Token OK\n');
 
-// Step 2: GetAllOptions
-const optRes = await fetch(
-  'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3',
-  {
-    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json', 'componentid': '1' },
-    signal: AbortSignal.timeout(15000),
-  }
-);
-const opts = await optRes.json();
-console.log(`GetAllOptions status: ${optRes.status}\n`);
+// Decode JWT to find real component_id
+const jwtPayload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+console.log('JWT claims:', JSON.stringify(jwtPayload, null, 2));
+
+// Step 2: GetAllOptions — try without componentid first, then with JWT value
+const componentId = jwtPayload.component_id ?? jwtPayload.componentid ?? jwtPayload.componentId ?? null;
+console.log(`\ncomponent_id from JWT: ${componentId}`);
+
+let opts;
+for (const cid of [null, componentId, '1', 'premiergolf'].filter((v, i, a) => a.indexOf(v) === i)) {
+  const headers = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
+  if (cid) headers['componentid'] = String(cid);
+  const r = await fetch(
+    'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3',
+    { headers, signal: AbortSignal.timeout(15000) }
+  );
+  const body = await r.text();
+  console.log(`GetAllOptions componentid=${cid}: ${r.status} — ${body.slice(0, 120)}`);
+  if (r.ok) { opts = JSON.parse(body); break; }
+  await new Promise(r => setTimeout(r, 300));
+}
+if (!opts) { console.error('GetAllOptions failed all attempts'); process.exit(1); }
+console.log('');
 
 // Step 3: Find all objects with any ID-like field near a course name
 const seattleCourses = ['jackson', 'jefferson', 'west seattle', 'interbay', 'legion', 'bellevue'];
