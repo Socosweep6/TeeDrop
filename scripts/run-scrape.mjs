@@ -17,6 +17,7 @@
  *   HEADLESS      — set to 'false' to see the browser (debug mode)
  */
 
+import { randomUUID } from 'crypto';
 import { COURSES } from '../lib/courses.js';
 
 // Load .env.local if present (Chester doesn't run through Next.js)
@@ -345,299 +346,222 @@ async function scrapeGolfNow(course, dates) {
   return teeTimes;
 }
 
-// ── CPS (Premier Golf) — OAuth + API via Playwright browser ──────────────────
+// ── CPS (Premier Golf) — js1 password grant + TeeTimes REST API ──────────────
 //
-// Auth: grant_type=password OAuth to get a bearer token.
-// Course IDs: GetAllOptions API, intercepted from Angular's own requests.
-// Tee times: GetAvailableTimeSheet API, called in-browser to inherit cookies.
+// Auth:    POST /identityapi/connect/token (grant_type=password, js1/v4secret)
+// Pre-req: POST /RegisterTransactionId before each TeeTimes call
+// Search:  GET  /TeeTimes?searchDate=Thu+Apr+09+2026&courseIds=3,4,2,6,11,5&...
+//
+// Confirmed from live browser capture 2026-04-09:
+//   - Endpoint: TeeTimes (NOT GetAvailableTimeSheet, NOT SearchTeetimes)
+//   - Date format: Date.toDateString() e.g. "Thu Apr 09 2026"
+//   - x-moduleid must be "7" (not "1")
+//   - One call returns all courses — no per-course loop needed
 //
 // Requires CPS_EMAIL and CPS_PASSWORD env vars. Skips cleanly if missing.
-// client_id/client_secret are public constants baked into the Angular app.
+
+// Confirmed courseIds from GetAllOptions (captured 2026-04-09)
+const CPS_COURSES = {
+  'Jackson Park Golf Course':    { id: 3,  holes: 18 },
+  'Jefferson Park Golf Course':  { id: 4,  holes: 18 },
+  'West Seattle Golf Course':    { id: 2,  holes: 18 },
+  'Interbay Golf Center':        { id: 6,  holes: 9  },
+  'Legion Memorial Golf Course': { id: 11, holes: 18 },
+  'Bellevue Golf Course':        { id: 5,  holes: 18 },
+};
+const CPS_ID_TO_NAME = Object.fromEntries(
+  Object.entries(CPS_COURSES).map(([name, { id }]) => [id, name])
+);
+const CPS_ALL_IDS = Object.values(CPS_COURSES).map(c => c.id).join(',');
+const CPS_API = 'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation';
 
 let cpsToken = null;
-let cpsCourseIdMap = {};
-let cpsComponentId = null;
-let cpsAngularHeaders = null;
-let cpsPage = null;
-let cpsInitialized = false;
+let cpsTokenExpiry = 0;
 
-async function initCps(browser) {
-  if (cpsInitialized) return;
+async function getCpsToken() {
+  if (cpsToken && Date.now() < cpsTokenExpiry - 60_000) return cpsToken;
 
-  if (!CPS_EMAIL || !CPS_PASSWORD) {
-    console.log('  [CPS] Skipping — CPS_EMAIL / CPS_PASSWORD not set');
-    cpsInitialized = true;
-    return;
-  }
+  const res = await fetch('https://premiergolf.cps.golf/identityapi/connect/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA },
+    body: new URLSearchParams({
+      grant_type: 'password',
+      scope: 'openid profile onlinereservation sale inventory sh customer email recommend references',
+      username: CPS_EMAIL,
+      password: CPS_PASSWORD,
+      client_id: 'js1',
+      client_secret: 'v4secret',
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
 
-  // Step 1: OAuth token
-  console.log(`  [CPS] OAuth login as ${CPS_EMAIL}...`);
-  try {
-    const tokenRes = await fetch(
-      'https://premiergolf.cps.golf/identityapi/connect/token',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type: 'password',
-          username: CPS_EMAIL,
-          password: CPS_PASSWORD,
-          client_id: 'js1',
-          client_secret: 'v4secret',
-          scope: 'onlinereservation references',
-        }),
-        signal: AbortSignal.timeout(15000),
-      }
-    );
-    const tokenJson = await tokenRes.json();
-    if (!tokenJson.access_token) {
-      throw new Error(`Token error: ${JSON.stringify(tokenJson)}`);
-    }
-    cpsToken = tokenJson.access_token;
-    try {
-      const payload = JSON.parse(Buffer.from(cpsToken.split('.')[1], 'base64url').toString());
-      cpsComponentId = payload.component_id ? String(payload.component_id) : null;
-      console.log(`  [CPS] Token OK. component_id=${cpsComponentId}`);
-    } catch {
-      console.log('  [CPS] Token OK (could not decode JWT)');
-    }
-  } catch (err) {
-    console.error(`  [CPS] OAuth failed: ${err.message}`);
-    cpsInitialized = true;
-    return;
-  }
+  const json = await res.json();
+  if (!json.access_token) throw new Error(`CPS auth failed: ${JSON.stringify(json)}`);
 
-  // Step 2: Browser session — intercept Angular's own GetAllOptions call to
-  // capture the real componentid header and build the course ID map.
-  try {
-    const context = await browser.newContext({
-      userAgent: UA,
-      viewport: { width: 1280, height: 900 },
-    });
-    cpsPage = await context.newPage();
-
-    const headersReady = new Promise((resolve) => {
-      cpsPage.on('request', req => {
-        if (req.url().includes('GetAllOptions')) {
-          const headers = req.headers();
-          cpsAngularHeaders = headers;
-          const cidKey = Object.keys(headers).find(k => k.toLowerCase().includes('componentid'));
-          if (cidKey) {
-            cpsComponentId = headers[cidKey];
-            console.log(`  [CPS] componentid captured: ${cpsComponentId}`);
-          }
-          resolve(headers);
-        }
-      });
-      cpsPage.on('response', async resp => {
-        if (resp.url().includes('GetAllOptions') && resp.status() === 200) {
-          try { buildCpsCourseMap(await resp.json()); } catch {}
-        }
-      });
-    });
-
-    await cpsPage.goto(
-      'https://premiergolf.cps.golf/reserve/jackson-park-golf-course',
-      { waitUntil: 'networkidle', timeout: 30000 }
-    );
-    await Promise.race([headersReady, delay(5000)]);
-    console.log(`  [CPS] Browser at: ${cpsPage.url().slice(0, 80)}`);
-  } catch (err) {
-    console.error(`  [CPS] Browser setup error: ${err.message}`);
-    cpsPage = null;
-  }
-
-  // Step 3: If Angular didn't fire GetAllOptions, try a direct call
-  if (Object.keys(cpsCourseIdMap).length === 0) {
-    console.log('  [CPS] No courses from Angular — trying direct GetAllOptions');
-    await fetchCpsAllOptions();
-  }
-
-  cpsInitialized = true;
-  console.log(`  [CPS] Ready. Token: ${cpsToken ? 'YES' : 'NO'} | Courses: ${Object.keys(cpsCourseIdMap).length} | Browser: ${cpsPage ? 'YES' : 'NO'}`);
+  cpsToken = json.access_token;
+  cpsTokenExpiry = Date.now() + (json.expires_in ?? 3600) * 1000;
+  console.log(`  [CPS] Token OK (expires in ${json.expires_in}s)`);
+  return cpsToken;
 }
 
-async function fetchCpsAllOptions() {
-  const url = 'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation/GetAllOptions/premiergolf?version=25.4.2&product=3';
-  try {
-    if (cpsPage) {
-      const result = await cpsPage.evaluate(
-        async ({ url, userToken, componentId }) => {
-          const hdrs = { 'Accept': 'application/json', 'Authorization': `Bearer ${userToken}` };
-          if (componentId) hdrs['x-componentid'] = componentId;
-          const r = await fetch(url, { headers: hdrs }).catch(e => ({ ok: false, status: 0, statusText: e.message, text: () => e.message }));
-          const t = typeof r.text === 'function' ? await r.text() : (r.statusText || '');
-          return { status: r.status, text: t };
-        },
-        { url, userToken: cpsToken, componentId: cpsComponentId }
-      );
-      if (result.status === 200) {
-        buildCpsCourseMap(JSON.parse(result.text));
-        console.log(`  [CPS] GetAllOptions OK (in-browser): ${Object.keys(cpsCourseIdMap).length} courses`);
-        return;
-      }
-      console.log(`  [CPS] GetAllOptions HTTP ${result.status} — ${result.text.slice(0, 100)}`);
-    } else {
-      const res = await fetch(url, {
-        headers: {
-          'Authorization': `Bearer ${cpsToken}`,
-          'Accept': 'application/json',
-          'x-componentid': cpsComponentId || '1',
-        },
-        signal: AbortSignal.timeout(15000),
-      });
-      if (res.ok) {
-        buildCpsCourseMap(await res.json());
-        console.log(`  [CPS] GetAllOptions OK (direct): ${Object.keys(cpsCourseIdMap).length} courses`);
-      } else {
-        console.log(`  [CPS] GetAllOptions HTTP ${res.status} (direct)`);
-      }
-    }
-  } catch (err) {
-    console.warn(`  [CPS] GetAllOptions error: ${err.message}`);
-  }
-}
-
-function buildCpsCourseMap(options) {
-  const walk = (obj) => {
-    if (!obj || typeof obj !== 'object') return;
-    if (Array.isArray(obj)) { obj.forEach(walk); return; }
-    if (obj.courseId != null && (obj.name || obj.courseName || obj.siteName)) {
-      const rawName = (obj.name || obj.courseName || obj.siteName || '').toLowerCase().trim();
-      cpsCourseIdMap[`__name:${rawName}`] = obj.courseId;
-    }
-    Object.values(obj).forEach(walk);
+function buildCpsHeaders(token) {
+  return {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/json',
+    'User-Agent': UA,
+    'client-id': 'onlineresweb',
+    'x-terminalid': '3',
+    'x-requestid': randomUUID(),
+    'x-websiteid': 'fbe1de5b-8700-4db9-d7d2-08da3ce0bbaa',
+    'x-ismobile': 'false',
+    'x-productid': '1',
+    'x-componentid': '1',
+    'x-siteid': '1',
+    'x-timezone-offset': String(new Date().getTimezoneOffset()),
+    'x-timezoneid': 'America/Los_Angeles',
+    'x-moduleid': '7',
   };
-  walk(options);
 }
 
-function getCpsCourseId(cpsSlug) {
-  const tokens = cpsSlug
-    .replace(/-golf-course$|-golf-center$|-golf$/, '')
-    .split('-')
-    .filter(t => t.length > 2);
-  for (const [key, id] of Object.entries(cpsCourseIdMap)) {
-    const name = key.replace('__name:', '');
-    if (tokens.every(t => name.includes(t))) return id;
-    if (tokens[0] && name.startsWith(tokens[0])) return id;
-  }
-  return null;
+// CPS expects "Thu Apr 09 2026" — use local date parts to avoid UTC shift
+function toCpsDate(isoDate) {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  return new Date(y, m - 1, d).toDateString();
 }
 
-function extractCpsTeeTimesFromJson(json) {
-  const candidates = [
-    json.tee_times, json.teeTimes, json.times, json.data,
-    json.availableTimes, json.available_times, json.slots,
-    json.timeSheet, json.TimeSheet, json.teeSheet, json.TeeSheet,
-    Array.isArray(json) ? json : null,
-  ].filter(Boolean);
-
-  for (const arr of candidates) {
-    if (!Array.isArray(arr) || arr.length === 0) continue;
-    const first = arr[0];
-    const timeField = ['time', 'start_time', 'teeTime', 'TeeTime', 'startTime', 'StartTime', 'teeTimeFrom']
-      .find(f => first[f] != null);
-    if (!timeField) continue;
-    return arr.map(slot => ({
-      time: formatTime(slot[timeField]),
-      players: slot.available_spots ?? slot.availableSpots ?? slot.maxPlayers ?? slot.MaxPlayers ?? 4,
-      price: slot.price != null
-        ? (typeof slot.price === 'string' ? slot.price : `$${(slot.price / 100).toFixed(2)}`)
-        : null,
-      holes: slot.holes ?? slot.nb_holes ?? slot.HoleCount ?? 18,
-    }));
-  }
-  return [];
+function extractCpsPrice(slot) {
+  const rate = slot.defaultBookingRate;
+  if (!rate) return 'N/A';
+  if (rate.price != null) return `$${Number(rate.price).toFixed(2)}`;
+  if (rate.greensFee != null) return `$${Number(rate.greensFee).toFixed(2)}`;
+  if (rate.amount != null) return `$${Number(rate.amount).toFixed(2)}`;
+  return 'N/A';
 }
 
-async function scrapeCPS(course, dates) {
-  if (!cpsToken) {
-    process.stdout.write(`  [CPS] No token — skipping\n`);
+async function scrapeCpsAll(dates) {
+  if (!CPS_EMAIL || !CPS_PASSWORD) {
+    console.log('[CPS] Skipping — CPS_EMAIL / CPS_PASSWORD not set');
     return [];
   }
-  const courseId = getCpsCourseId(course.cpsSlug);
-  if (!courseId) {
-    process.stdout.write(`  [CPS] No courseId for ${course.cpsSlug} — skipping\n`);
+
+  console.log('\n[CPS] Starting — all courses, pure HTTP (no browser)');
+  let token;
+  try {
+    token = await getCpsToken();
+  } catch (err) {
+    console.error(`[CPS] Auth failed: ${err.message}`);
     return [];
   }
-  process.stdout.write(`  [CPS] courseId=${courseId} for ${course.cpsSlug}\n`);
 
-  const holeCount = course.holes === 9 ? 9 : 18;
-  const results = [];
+  const allResults = [];
 
   for (const date of dates) {
-    const [y, m, d] = date.split('-');
-    const bookingDate = `${m}/${d}/${y}`;
-    const base = 'https://premiergolf.cps.golf/onlineres/onlineapi/api/v1/onlinereservation';
-    const qs = `courseId=${courseId}&bookingDate=${encodeURIComponent(bookingDate)}&holeCount=${holeCount}&players=1&numberOfGuests=0`;
-    const url = `${base}/GetAvailableTimeSheet/premiergolf?${qs}&product=3`;
+    const transactionId = randomUUID();
+
+    // Register transaction (required before TeeTimes)
+    try {
+      await fetch(`${CPS_API}/RegisterTransactionId`, {
+        method: 'POST',
+        headers: { ...buildCpsHeaders(token), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transactionId }),
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch {
+      // Non-fatal — continue anyway
+    }
+
+    // Refresh token if needed
+    try {
+      token = await getCpsToken();
+    } catch (err) {
+      console.error(`  [CPS] Token refresh failed: ${err.message}`);
+      break;
+    }
+
+    // Query all courses for this date in one call
+    const params = new URLSearchParams({
+      searchDate: toCpsDate(date),
+      holes: '0',
+      numberOfPlayer: '0',
+      courseIds: CPS_ALL_IDS,
+      searchTimeType: '0',
+      transactionId,
+      teeOffTimeMin: '0',
+      teeOffTimeMax: '23',
+      isChangeTeeOffTime: 'true',
+      teeSheetSearchView: '5',
+      classCode: 'R',
+      defaultOnlineRate: 'N',
+      isUseCapacityPricing: 'false',
+      memberStoreId: '1',
+      searchType: '1',
+    });
 
     try {
-      let status, text;
+      const res = await fetch(`${CPS_API}/TeeTimes?${params}`, {
+        headers: buildCpsHeaders(token),
+        signal: AbortSignal.timeout(15000),
+      });
 
-      if (cpsPage) {
-        const result = await cpsPage.evaluate(
-          async ({ url, token, angularHeaders }) => {
-            try {
-              const hdrs = angularHeaders ? { ...angularHeaders } : {};
-              hdrs['authorization'] = `Bearer ${token}`;
-              hdrs['accept'] = 'application/json';
-              const res = await fetch(url, { headers: hdrs });
-              return { status: res.status, text: await res.text() };
-            } catch (e) {
-              return { status: 0, text: e.message };
-            }
-          },
-          { url, token: cpsToken, angularHeaders: cpsAngularHeaders }
-        );
-        status = result.status;
-        text = result.text;
-      } else {
-        const res = await fetch(url, {
-          headers: {
-            'Authorization': `Bearer ${cpsToken}`,
-            'x-componentid': cpsComponentId || '1',
-            'Accept': 'application/json',
-          },
-          signal: AbortSignal.timeout(10000),
-        });
-        status = res.status;
-        text = await res.text();
-      }
-
-      if (status === 401) {
-        process.stdout.write(`  [CPS] 401 — token expired\n`);
+      if (res.status === 401) {
+        console.log('  [CPS] 401 — forcing token refresh');
         cpsToken = null;
-        break;
-      }
-      if (status !== 200) {
-        process.stdout.write(`  ${date}: HTTP ${status} — ${text.slice(0, 80)}\n`);
+        token = await getCpsToken();
         continue;
       }
 
-      const times = extractCpsTeeTimesFromJson(JSON.parse(text));
-      const batch = times.map(t => ({
-        course: course.name,
-        date,
-        time: t.time,
-        players: t.players,
-        price: t.price || 'N/A',
-        holes: t.holes || course.holes || 18,
-        bookingUrl: `${course.bookingUrl}?date=${date}`,
-        source: 'cps',
-      })).filter(t => t.time);
+      if (!res.ok) {
+        process.stdout.write(`  [CPS] ${date}: HTTP ${res.status}\n`);
+        await delay(500);
+        continue;
+      }
 
-      process.stdout.write(`  ${date}: ${batch.length} times\n`);
+      const json = await res.json();
+      if (!json.isSuccess || !Array.isArray(json.content)) {
+        process.stdout.write(`  [CPS] ${date}: isSuccess=${json.isSuccess}, no content array\n`);
+        continue;
+      }
+
+      const batch = [];
+      for (const slot of json.content) {
+        const courseName = CPS_ID_TO_NAME[slot.courseId];
+        if (!courseName) continue;
+
+        const course = COURSES.find(c => c.name === courseName);
+        if (!course) continue;
+
+        const time = formatTime(slot.startTime);
+        if (!time) continue;
+
+        // Available spots = max participants minus already-booked
+        const booked = Array.isArray(slot.bookingList) ? slot.bookingList.length : 0;
+        const available = (slot.participants ?? 4) - booked;
+
+        batch.push({
+          course: courseName,
+          date,
+          time,
+          players: available > 0 ? available : (slot.participants ?? 4),
+          price: extractCpsPrice(slot),
+          holes: slot.is18HoleOnly ? 18 : (CPS_COURSES[courseName]?.holes ?? 18),
+          bookingUrl: `${course.bookingUrl}?date=${date}`,
+          source: 'cps',
+        });
+      }
+
+      process.stdout.write(`  [CPS] ${date}: ${batch.length} times\n`);
       if (batch.length > 0) {
         await ingest(batch);
-        results.push(...batch);
+        allResults.push(...batch);
       }
     } catch (err) {
-      process.stdout.write(`  ${date}: error — ${err.message.split('\n')[0]}\n`);
+      process.stdout.write(`  [CPS] ${date}: error — ${err.message.split('\n')[0]}\n`);
     }
-    await delay(500);
+
+    await delay(400);
   }
-  return results;
+
+  return allResults;
 }
 
 // ── Routing ───────────────────────────────────────────────────────────────────
@@ -645,7 +569,6 @@ async function scrapeCPS(course, dates) {
 async function processCourse(course, dates) {
   if (course.bookingSystem === 'chronogolf') return scrapeChronogolf(course, dates);
   if (course.bookingSystem === 'golfnow') return scrapeGolfNow(course, dates);
-  if (course.bookingSystem === 'cps') return scrapeCPS(course, dates);
   process.stdout.write(`\n[${course.name}] Unknown booking system: ${course.bookingSystem}\n`);
   return [];
 }
@@ -680,37 +603,10 @@ async function main() {
     await delay(2000);
   }
 
-  // CPS — init browser once, share across all courses
-  let cpsBrowser = null;
+  // CPS — single HTTP-only pass covering all 6 courses × all dates
   if (cpsCourses.length > 0) {
-    if (!CPS_EMAIL || !CPS_PASSWORD) {
-      console.log('[CPS] Skipping all CPS courses — CPS_EMAIL / CPS_PASSWORD not set\n');
-    } else {
-      try {
-        const { chromium } = await import('playwright');
-        cpsBrowser = await chromium.launch({
-          headless: HEADLESS,
-          args: ['--no-sandbox', '--disable-setuid-sandbox'],
-        });
-        console.log('Initializing CPS...');
-        await initCps(cpsBrowser);
-        console.log('');
-      } catch (err) {
-        console.log(`[CPS] Playwright not available — skipping CPS courses: ${err.message}\n`);
-      }
-    }
-  }
-
-  try {
-    for (const course of cpsCourses) {
-      process.stdout.write(`\n[${course.name}] CPS/API\n`);
-      const found = await scrapeCPS(course, dates);
-      total += found.length;
-      await delay(500);
-    }
-  } finally {
-    if (cpsPage) await cpsPage.context().close().catch(() => {});
-    if (cpsBrowser) await cpsBrowser.close().catch(() => {});
+    const found = await scrapeCpsAll(dates);
+    total += found.length;
   }
 
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
