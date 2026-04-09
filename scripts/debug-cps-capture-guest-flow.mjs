@@ -66,7 +66,7 @@ page.on('response', async resp => {
     ts: new Date().toISOString(),
     status: resp.status(),
     url,
-    headers: Object.fromEntries(resp.headers()),
+    headers: resp.headers(), // already a plain object in Playwright
     body,
   };
   log.playwrightResponses.push(entry);
